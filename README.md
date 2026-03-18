@@ -6,7 +6,7 @@ Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests
 
 ## Requirements
 
-[Babashka](https://github.com/babashka/babashka) (deps are fetched automatically on first run).
+[Babashka](https://github.com/babashka/babashka) >= 1.12.215 (deps are fetched automatically on first run).
 
 ## Usage
 
@@ -51,5 +51,5 @@ Request JSON schema enforcement via `response_format` in the request body. Strat
 
 ## Documentation
 
-- [API Reference](API.md) — endpoints, request/response formats, structured output details
-- [Supported Models](MODELS.md) — tested models and implemented chat templates
+- [API Reference](doc/API.md) — endpoints, request/response formats, structured output details
+- [Supported Models](doc/MODELS.md) — tested models and implemented chat templates

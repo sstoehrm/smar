@@ -18,6 +18,166 @@
          '[malli.error :as me]
          '[malli.json-schema :as mjs])
 
+(import '[org.jline.terminal TerminalBuilder]
+        '[org.jline.utils AttributedStringBuilder AttributedStyle])
+
+;; ---------------------------------------------------------------------------
+;; TUI — terminal output via JLine3
+;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *terminal* nil)
+
+(defn create-terminal []
+  (-> (TerminalBuilder/builder)
+      (.system true)
+      (.jansi true)
+      (.build)))
+
+(defn styled [text & styles]
+  (let [sb    (AttributedStringBuilder.)
+        style (reduce (fn [s kw]
+                        (case kw
+                          :bold    (.bold s)
+                          :green   (.foreground s AttributedStyle/GREEN)
+                          :red     (.foreground s AttributedStyle/RED)
+                          :yellow  (.foreground s AttributedStyle/YELLOW)
+                          :cyan    (.foreground s AttributedStyle/CYAN)
+                          :magenta (.foreground s AttributedStyle/MAGENTA)
+                          :white   (.foreground s AttributedStyle/WHITE)
+                          :dim     (.faint s)
+                          s))
+                      AttributedStyle/DEFAULT
+                      styles)]
+    (.style sb style)
+    (.append sb (str text))
+    (.style sb AttributedStyle/DEFAULT)
+    (if *terminal*
+      (.toAnsi sb *terminal*)
+      (str text))))
+
+(defn tui-print [& parts]
+  (let [line (apply str parts)]
+    (if *terminal*
+      (let [w (.writer *terminal*)]
+        (.println w line)
+        (.flush w))
+      (println line))))
+
+(defn tui-print-no-nl [& parts]
+  (let [line (apply str parts)]
+    (if *terminal*
+      (let [w (.writer *terminal*)]
+        (.print w line)
+        (.flush w))
+      (print line))))
+
+(defn clear-line []
+  (tui-print-no-nl "\r\033[2K"))
+
+;; ---------------------------------------------------------------------------
+;; TUI — request tracking for server mode
+;; ---------------------------------------------------------------------------
+
+(def request-stats (atom {:total 0 :active 0 :errors 0 :last-requests []}))
+
+(defn track-request-start [method uri]
+  (swap! request-stats (fn [s]
+                         (-> s
+                             (update :total inc)
+                             (update :active inc)))))
+
+(defn track-request-end [method uri status latency-ms]
+  (swap! request-stats (fn [s]
+                         (-> s
+                             (update :active dec)
+                             (cond-> (>= status 400) (update :errors inc))
+                             (update :last-requests
+                                     (fn [reqs]
+                                       (take 20 (cons {:method  method
+                                                       :uri     uri
+                                                       :status  status
+                                                       :latency latency-ms
+                                                       :time    (java.time.LocalTime/now)}
+                                                      reqs))))))))
+
+(defn format-status [status]
+  (cond
+    (< status 300) (styled (str status) :green)
+    (< status 400) (styled (str status) :yellow)
+    :else          (styled (str status) :red)))
+
+(defn format-method [method]
+  (styled (str/upper-case (name method)) :cyan :bold))
+
+(defn format-latency [ms]
+  (cond
+    (< ms 100)  (styled (format "%4dms" ms) :green)
+    (< ms 1000) (styled (format "%4dms" ms) :yellow)
+    :else        (styled (format "%4dms" ms) :red)))
+
+(defn log-request [method uri status latency-ms]
+  (tui-print (styled (str (java.time.LocalTime/now)) :dim)
+             " "
+             (format-method method)
+             " " uri
+             " " (format-status status)
+             " " (format-latency latency-ms)))
+
+;; ---------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------
+
+(def worker-threads 4)
+
+;; ---------------------------------------------------------------------------
+;; TUI — startup display
+;; ---------------------------------------------------------------------------
+
+(defn spinner-frames [] ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
+
+(defn with-spinner [message work-fn]
+  (let [frames  (spinner-frames)
+        running (atom true)
+        result  (promise)
+        spin-thread (Thread.
+                     (fn []
+                       (loop [i 0]
+                         (when @running
+                           (clear-line)
+                           (tui-print-no-nl (styled (nth frames (mod i (count frames))) :cyan)
+                                            " " message)
+                           (Thread/sleep 80)
+                           (recur (inc i))))))]
+    (.start spin-thread)
+    (try
+      (let [r (work-fn)]
+        (reset! running false)
+        (.join spin-thread 200)
+        (clear-line)
+        r)
+      (catch Exception e
+        (reset! running false)
+        (.join spin-thread 200)
+        (clear-line)
+        (throw e)))))
+
+(defn print-banner [server-port base-url backend-type]
+  (tui-print)
+  (tui-print (styled "smar" :cyan :bold) (styled " — small agent harness" :dim))
+  (tui-print)
+  (tui-print (styled "  server   " :dim) (styled (str "http://0.0.0.0:" server-port) :white :bold))
+  (tui-print (styled "  backend  " :dim) (styled base-url :white) " " (styled (str "[" (name backend-type) "]") :magenta))
+  (tui-print (styled "  threads  " :dim) (styled (str worker-threads) :white))
+  (tui-print)
+  (tui-print (styled "  Endpoints:" :dim))
+  (tui-print (styled "    POST " :cyan) "/v1/chat/completions")
+  (tui-print (styled "    POST " :cyan) "/v1/completions")
+  (tui-print (styled "    GET  " :cyan) "/v1/models")
+  (tui-print (styled "    GET  " :cyan) "/admin/health")
+  (tui-print)
+  (tui-print (styled "  Ctrl-C to stop" :dim))
+  (tui-print))
+
 ;; ---------------------------------------------------------------------------
 ;; Chat templates
 ;; ---------------------------------------------------------------------------
@@ -356,6 +516,26 @@
                         :backend_type (name (:type backend))
                         :base_url base-url})))
 
+(defn wrap-request-tracking [handler]
+  (fn [req]
+    (let [method (:request-method req)
+          uri    (:uri req)
+          start  (System/currentTimeMillis)]
+      (track-request-start method uri)
+      (try
+        (let [resp    (handler req)
+              latency (- (System/currentTimeMillis) start)
+              status  (:status resp)]
+          (track-request-end method uri status latency)
+          (log-request method uri status latency)
+          resp)
+        (catch Exception e
+          (let [latency (- (System/currentTimeMillis) start)]
+            (track-request-end method uri 500 latency)
+            (log-request method uri 500 latency)
+            (json-response 500 {:error {:message (.getMessage e)
+                                         :type "internal_error"}})))))))
+
 (defn router [base-url]
   (fn [req]
     (let [uri    (:uri req)
@@ -389,11 +569,14 @@
               (swap! total inc)
               (if pred
                 (do (swap! pass inc)
-                    (println "  PASS" label))
+                    (tui-print "  " (styled "PASS" :green) " " label))
                 (do (swap! fail inc)
-                    (println "  FAIL" label))))]
+                    (tui-print "  " (styled "FAIL" :red :bold) " " label))))
+            (section [title]
+              (tui-print)
+              (tui-print (styled (str "── " title " ──") :cyan :bold)))]
 
-      (println "--- Chat templates ---")
+      (section "Chat templates")
       (let [result (apply-template :chatml [{:role "user" :content "hello"}])]
         (check "chatml wraps user message"
                (and (str/includes? result "<|im_start|>user")
@@ -410,7 +593,7 @@
       (check "detect fallback to chatml"
              (= :chatml (detect-template-from-model "some-random-model")))
 
-      (println "--- GBNF generation ---")
+      (section "GBNF generation")
       (let [gbnf (json-schema->gbnf {"type" "object"
                                       "properties" {"name" {"type" "string"}
                                                     "age"  {"type" "integer"}}})]
@@ -419,7 +602,7 @@
         (check "gbnf references name field" (str/includes? gbnf "name"))
         (check "gbnf references age field" (str/includes? gbnf "age")))
 
-      (println "--- Schema validation ---")
+      (section "Schema validation")
       (let [schema {"type" "object"
                     "properties" {"name" {"type" "string"}
                                   "age"  {"type" "integer"}}
@@ -431,7 +614,7 @@
         (check "malformed json fails"
                (not (:valid (validate-response schema "not json")))))
 
-      (println "--- Request translation ---")
+      (section "Request translation")
       (let [req {:model "llama3" :messages [{:role "user" :content "hi"}]
                  :temperature 0.5}]
         (let [ollama (translate-request :ollama req)]
@@ -446,7 +629,7 @@
           (check "llamacpp url" (= "/v1/chat/completions" (:url llama)))
           (check "llamacpp passes body through" (= req (:body llama)))))
 
-      (println "--- Response translation ---")
+      (section "Response translation")
       (let [resp {:body (json/generate-string
                          {:model "llama3"
                           :message {:role "assistant" :content "hello back"}})}]
@@ -459,7 +642,7 @@
           (check "koboldcpp response extracts text"
                  (= "kobold says hi" (get-in result [:choices 0 :message :content])))))
 
-      (println "--- Strategy selection ---")
+      (section "Strategy selection")
       (check "grammar when supported"
              (= :grammar (choose-strategy :llamacpp {})))
       (check "validate when not supported"
@@ -469,13 +652,17 @@
       (check "header override to grammar"
              (= :grammar (choose-strategy :ollama {"x-smar-strategy" "grammar"})))
 
-      (println "--- Routing ---")
+      (section "Routing")
       (let [handler (router "http://localhost:99999")]
         (let [resp (handler {:uri "/nonexistent" :request-method :get})]
           (check "404 for unknown route" (= 404 (:status resp)))))
 
-      (println)
-      (println (str @pass "/" @total " passed, " @fail " failed"))
+      (tui-print)
+      (let [p @pass f @fail t @total]
+        (if (zero? f)
+          (tui-print (styled (str p "/" t " passed") :green :bold))
+          (tui-print (styled (str p "/" t " passed, " f " failed") :red :bold))))
+      (tui-print)
       (when (pos? @fail)
         (System/exit 1)))))
 
@@ -484,25 +671,31 @@
 ;; ---------------------------------------------------------------------------
 
 (defn -main [& args]
-  (cond
-    (some #{"--self-test"} args)
-    (run-self-test)
+  (binding [*terminal* (create-terminal)]
+    (try
+      (cond
+        (some #{"--self-test"} args)
+        (run-self-test)
 
-    (= 2 (count args))
-    (let [server-port (Integer/parseInt (first args))
-          remote-port (Integer/parseInt (second args))
-          base-url    (str "http://localhost:" remote-port)]
-      (println (str "smar: probing backend at " base-url "..."))
-      (let [backend (get-backend base-url)]
-        (println (str "smar: detected " (name (:type backend)) " backend"))
-        (println (str "smar: listening on port " server-port))
-        (http/run-server (router base-url) {:port server-port})
-        @(promise)))
+        (= 2 (count args))
+        (let [server-port (Integer/parseInt (first args))
+              remote-port (Integer/parseInt (second args))
+              base-url    (str "http://localhost:" remote-port)]
+          (let [backend-type (with-spinner
+                               (str "probing backend at " base-url)
+                               #(probe-backend base-url))]
+            (reset! backend-state {:type backend-type :base-url base-url})
+            (print-banner server-port base-url backend-type)
+            (http/run-server (wrap-request-tracking (router base-url))
+                             {:port server-port :thread worker-threads})
+            @(promise)))
 
-    :else
-    (do
-      (println "Usage: bb smar.bb.clj <server-port> <remote-port>")
-      (println "       bb smar.bb.clj --self-test")
-      (System/exit 1))))
+        :else
+        (do
+          (tui-print (styled "Usage:" :bold) " bb smar.bb.clj <server-port> <remote-port>")
+          (tui-print (styled "       " :bold) " bb smar.bb.clj --self-test")
+          (System/exit 1)))
+      (finally
+        (.close *terminal*)))))
 
 (apply -main *command-line-args*)

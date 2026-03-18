@@ -1,134 +1,48 @@
 # smar — small agent harness
 
-Babashka proxy server that sits between clients and LLM backends,
-providing a unified OpenAI-compatible API with structured output enforcement.
+Single-file Babashka proxy (`smar.bb.clj`) between clients and local LLM backends.
+OpenAI-compatible API with structured output enforcement.
 
-Single-file design: everything lives in `smar.bb.clj`. No separate
-`bb.edn` — deps are loaded inline via `babashka.deps/add-deps`.
-
-## Usage
+## Quick reference
 
 ```bash
-bb smar.bb.clj <server-port> <remote-port>
-bb smar.bb.clj --self-test
+bb smar.bb.clj <server-port> <remote-port>   # start server
+bb smar.bb.clj --self-test                    # run inline tests
 ```
 
-- `server-port` — port smar listens on (the OpenAI-compatible API)
-- `remote-port` — port of the LLM backend to proxy to (localhost)
-- `--self-test` — run inline tests and exit (no server started, no backend needed)
+## Architecture
 
-Examples:
+- Single file: `smar.bb.clj` — deps loaded inline via `babashka.deps/add-deps`
+- Requires Babashka >= 1.12.215 (JLine3 for TUI)
+- Deps: malli (inline), httpkit + cheshire (bundled in bb)
+- Server: httpkit with configurable thread pool (`worker-threads` constant)
 
-```bash
-bb smar.bb.clj 8080 11434    # listen on 8080, proxy to ollama on 11434
-bb smar.bb.clj --self-test   # run all inline tests
-```
+## TUI (JLine3)
 
-The self-test exercises request/response translation, GBNF generation,
-schema validation, chat template rendering, and routing — everything
-that can be tested without a live backend.
+Terminal output uses JLine3 `AttributedStringBuilder` for styled/colored text.
+Key abstractions:
 
-## API surface
+- `styled` — creates ANSI-styled text via JLine3 `AttributedStyle`
+- `tui-print` / `tui-print-no-nl` — terminal-aware print (falls back to `println` if no terminal)
+- `with-spinner` — animated spinner for blocking operations (backend probe)
+- `log-request` — colored request log line (timestamp, method, uri, status, latency)
+- `wrap-request-tracking` — ring middleware tracking active/total/error counts per request
+- `*terminal*` — dynamic var bound in `-main`, threaded through all output
 
-**OpenAI-compatible** (primary):
-- `POST /v1/chat/completions` — chat completion (streaming + non-streaming)
-- `POST /v1/completions` — raw completion
-- `GET  /v1/models` — list available models
+Self-test uses green PASS / red FAIL with section headers.
+Server mode shows a startup banner + live colored request log.
 
-**Admin**:
-- `GET  /admin/health` — backend health check
+## Backend detection
 
-## Backend
-
-Single backend pointing at `http://localhost:<remote-port>`. Auto-detects
-the backend type by probing known endpoints on startup:
-
-| Probe                        | Type      |
-|------------------------------|-----------|
-| `GET /api/tags` responds     | ollama    |
-| `GET /api/v1/model` responds | koboldcpp |
-| otherwise                    | llamacpp  |
-
-Each type knows how to translate OpenAI-format requests to the native API:
-
-```clojure
-(defmulti translate-request :backend-type)   ;; OpenAI → native format
-(defmulti translate-response :backend-type)  ;; native → OpenAI format
-(defmulti list-models :backend-type)         ;; fetch available models
-(defmulti supports-grammar? :backend-type)   ;; GBNF grammar support?
-```
+Auto-detects by probing: `/api/tags` → ollama, `/api/v1/model` → koboldcpp, else → llamacpp.
+Translation via multimethods: `translate-request`, `translate-response`, `list-models-remote`.
 
 ## Structured output
 
-Two strategies, chosen per-request based on backend capabilities:
+Two strategies: GBNF grammar injection (llamacpp, koboldcpp) or validate+retry with malli (ollama).
+Override via `x-smar-strategy` header.
 
-1. **Grammar-constrained** — convert JSON schema → GBNF grammar, pass to
-   backends that support it (llama.cpp, koboldcpp). Output is structurally
-   guaranteed.
+## Docs
 
-2. **Validate + retry** — let the model generate freely, validate response
-   against JSON schema. On failure, re-prompt with the validation error
-   (up to 3 retries).
-
-Strategy selection: grammar-constrained when `(supports-grammar? backend)`
-is true, otherwise validate+retry. Client can force a strategy via
-`x-smar-strategy: grammar|validate` header.
-
-## Chat templates
-
-Resolved based on backend type and model metadata:
-
-```clojure
-(def templates
-  {:chatml  {:bos "<|im_start|>" :eos "<|im_end|>" ...}
-   :llama3  {:bos "<|begin_of_text|>" ...}
-   :mistral { ... }})
-```
-
-Template selection:
-1. Auto-detect from model metadata (ollama modelfile, gguf metadata)
-2. Fallback to ChatML
-
-Only relevant for raw completion endpoints. Chat-native endpoints
-(ollama `/api/chat`, llama.cpp `/v1/chat/completions`) handle their own
-templates — the proxy passes messages through.
-
-## Project layout
-
-```
-smar/
-└── smar.bb.clj     ;; everything (deps, server, logic)
-```
-
-## Dependencies
-
-Loaded inline at the top of `smar.bb.clj`:
-
-```clojure
-(require '[babashka.deps :as deps])
-(deps/add-deps '{:deps {metosin/malli {:mvn/version "0.16.4"}}})
-```
-
-Key libs:
-- **httpkit** (bundled in bb) — HTTP server + client
-- **malli** — schema validation
-- **cheshire** (bundled in bb) — JSON encode/decode
-
-## Request flow
-
-```
-Client (OpenAI-compat request)
-  → parse CLI args: server-port, remote-port
-  → router (ring handler)
-  → detect backend type (cached after first probe)
-  → translate request (OpenAI → native format)
-  → if structured output requested:
-      → grammar-capable? → inject GBNF grammar
-      → else             → mark for post-validation
-  → forward to http://localhost:<remote-port>
-  → translate response (native → OpenAI format)
-  → if post-validation:
-      → validate with malli
-      → on failure: retry with error context (up to 3)
-  → return response to client
-```
+- `doc/API.md` — endpoint reference
+- `doc/MODELS.md` — tested models and chat templates
