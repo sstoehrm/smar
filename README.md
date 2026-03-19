@@ -1,5 +1,7 @@
 # smar
 
+> **Experimental** — early development, APIs and behavior may change without notice, not recommended for production use.
+
 OpenAI-compatible proxy for local LLM backends. Single Babashka script, no config files.
 
 Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests/responses transparently.
@@ -48,6 +50,14 @@ curl http://localhost:8080/v1/chat/completions \
 ## Structured output
 
 Request JSON schema enforcement via `response_format` in the request body. Strategy is auto-selected based on backend capability (GBNF grammar injection or validate+retry). Override with the `x-smar-strategy` header (`grammar` or `validate`).
+
+## Limitations
+
+- Grammar strategy (GBNF) trusts the backend to enforce structure — no post-validation
+- Streaming support is limited to Ollama passthrough
+- No authentication or rate limiting
+- Single backend only (one remote-port per instance)
+- Error handling for unreachable backends is minimal
 
 ## Documentation
 
