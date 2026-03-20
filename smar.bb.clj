@@ -161,19 +161,19 @@
         (clear-line)
         (throw e)))))
 
-(defn print-banner [server-port base-url backend-type]
+(defn print-banner [server-port]
   (tui-print)
   (tui-print (styled "smar" :cyan :bold) (styled " — small agent harness" :dim))
   (tui-print)
   (tui-print (styled "  server   " :dim) (styled (str "http://0.0.0.0:" server-port) :white :bold))
-  (tui-print (styled "  backend  " :dim) (styled base-url :white) " " (styled (str "[" (name backend-type) "]") :magenta))
   (tui-print (styled "  threads  " :dim) (styled (str worker-threads) :white))
+  (tui-print (styled "  backend  " :dim) (styled "per-request via smar_target" :dim))
   (tui-print)
   (tui-print (styled "  Endpoints:" :dim))
   (tui-print (styled "    POST " :cyan) "/v1/chat/completions")
   (tui-print (styled "    POST " :cyan) "/v1/completions")
-  (tui-print (styled "    GET  " :cyan) "/v1/models")
-  (tui-print (styled "    GET  " :cyan) "/admin/health")
+  (tui-print (styled "    GET  " :cyan) "/v1/models" (styled "?target=..." :dim))
+  (tui-print (styled "    GET  " :cyan) "/admin/health" (styled "?target=..." :dim))
   (tui-print)
   (tui-print (styled "  Ctrl-C to stop" :dim))
   (tui-print))
@@ -295,7 +295,7 @@
 ;; Backend detection & translation
 ;; ---------------------------------------------------------------------------
 
-(def backend-state (atom nil))
+(def backend-cache (atom {}))
 
 (defn probe-backend [base-url]
   (let [try-get (fn [path]
@@ -310,11 +310,12 @@
       :else                     :llamacpp)))
 
 (defn get-backend [base-url]
-  (if-let [b @backend-state]
-    b
-    (let [detected (probe-backend base-url)]
-      (reset! backend-state {:type detected :base-url base-url})
-      @backend-state)))
+  (if-let [cached (get @backend-cache base-url)]
+    cached
+    (let [detected (probe-backend base-url)
+          backend  {:type detected :base-url base-url}]
+      (swap! backend-cache assoc base-url backend)
+      backend)))
 
 ;; -- translate-request ------------------------------------------------------
 
@@ -456,65 +457,93 @@
    :headers {"content-type" "application/json"}
    :body    (json/generate-string body)})
 
+(defn error-response [status message]
+  (json-response status {:error {:message message :type "invalid_request_error"}}))
+
+(defn extract-smar-fields [parsed-body]
+  (let [target (:smar_target parsed-body)
+        schema (:smar_schema parsed-body)]
+    (when target
+      {:target target
+       :schema schema
+       :body   (dissoc parsed-body :smar_target :smar_schema)})))
+
+(defn extract-target-from-query [req]
+  (when-let [qs (:query-string req)]
+    (some (fn [pair]
+            (let [[k v] (str/split pair #"=" 2)]
+              (when (= k "target") v)))
+          (str/split qs #"&"))))
+
 (defn get-response-schema [openai-req]
   (when-let [rf (:response_format openai-req)]
     (when (= (:type rf) "json_schema")
       (or (:schema rf)
           (get-in rf [:json_schema :schema])))))
 
-(defn handle-chat-completions [base-url req]
-  (let [backend      (get-backend base-url)
-        backend-type (:type backend)
-        openai-req   (parse-body req)
-        json-schema  (get-response-schema openai-req)
-        headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
-                                   (:headers req)))
-        strategy     (when json-schema
-                       (choose-strategy backend-type headers))]
-    (cond
-      (= strategy :grammar)
-      (let [translated (-> (translate-request backend-type openai-req)
-                           (inject-grammar json-schema))
-            raw-resp   (forward-request base-url translated)
-            response   (translate-response backend-type raw-resp)]
+(defn handle-chat-completions [req]
+  (let [parsed (parse-body req)]
+    (if-let [{:keys [target schema body]} (extract-smar-fields parsed)]
+      (let [backend      (get-backend target)
+            backend-type (:type backend)
+            openai-req   body
+            json-schema  (or schema (get-response-schema openai-req))
+            headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
+                                       (:headers req)))
+            strategy     (when json-schema
+                           (choose-strategy backend-type headers))]
+        (cond
+          (= strategy :grammar)
+          (let [translated (-> (translate-request backend-type openai-req)
+                               (inject-grammar json-schema))
+                raw-resp   (forward-request target translated)
+                response   (translate-response backend-type raw-resp)]
+            (json-response 200 response))
+
+          (= strategy :validate)
+          (let [response (complete-with-validation
+                          target backend-type openai-req json-schema 3)]
+            (json-response 200 response))
+
+          :else
+          (let [translated (translate-request backend-type openai-req)
+                raw-resp   (forward-request target translated)
+                response   (translate-response backend-type raw-resp)]
+            (json-response 200 response))))
+      (error-response 400 "Missing required field: smar_target"))))
+
+(defn handle-completions [req]
+  (let [parsed (parse-body req)]
+    (if-let [{:keys [target body]} (extract-smar-fields parsed)]
+      (let [backend      (get-backend target)
+            backend-type (:type backend)
+            openai-req   body
+            template-key (detect-template-from-model (:model openai-req))
+            prompt       (or (:prompt openai-req)
+                             (apply-template template-key
+                                             [{:role "user" :content (:prompt openai-req "")}]))
+            translated   (translate-request backend-type
+                                             (assoc openai-req
+                                                    :messages [{:role "user" :content prompt}]))
+            raw-resp     (forward-request target translated)
+            response     (translate-response backend-type raw-resp)]
         (json-response 200 response))
+      (error-response 400 "Missing required field: smar_target"))))
 
-      (= strategy :validate)
-      (let [response (complete-with-validation
-                      base-url backend-type openai-req json-schema 3)]
-        (json-response 200 response))
+(defn handle-models [req]
+  (if-let [target (extract-target-from-query req)]
+    (let [backend (get-backend target)
+          models  (list-models-remote (:type backend) target)]
+      (json-response 200 {:object "list" :data models}))
+    (error-response 400 "Missing required query parameter: target")))
 
-      :else
-      (let [translated (translate-request backend-type openai-req)
-            raw-resp   (forward-request base-url translated)
-            response   (translate-response backend-type raw-resp)]
-        (json-response 200 response)))))
-
-(defn handle-completions [base-url req]
-  (let [backend      (get-backend base-url)
-        backend-type (:type backend)
-        openai-req   (parse-body req)
-        template-key (detect-template-from-model (:model openai-req))
-        prompt       (or (:prompt openai-req)
-                         (apply-template template-key
-                                         [{:role "user" :content (:prompt openai-req "")}]))
-        translated   (translate-request backend-type
-                                         (assoc openai-req
-                                                :messages [{:role "user" :content prompt}]))
-        raw-resp     (forward-request base-url translated)
-        response     (translate-response backend-type raw-resp)]
-    (json-response 200 response)))
-
-(defn handle-models [base-url _req]
-  (let [backend (get-backend base-url)
-        models  (list-models-remote (:type backend) base-url)]
-    (json-response 200 {:object "list" :data models})))
-
-(defn handle-health [base-url _req]
-  (let [backend (get-backend base-url)]
-    (json-response 200 {:status "ok"
-                        :backend_type (name (:type backend))
-                        :base_url base-url})))
+(defn handle-health [req]
+  (if-let [target (extract-target-from-query req)]
+    (let [backend (get-backend target)]
+      (json-response 200 {:status "ok"
+                          :backend_type (name (:type backend))
+                          :base_url target}))
+    (error-response 400 "Missing required query parameter: target")))
 
 (defn wrap-request-tracking [handler]
   (fn [req]
@@ -536,22 +565,22 @@
             (json-response 500 {:error {:message (.getMessage e)
                                          :type "internal_error"}})))))))
 
-(defn router [base-url]
+(defn router []
   (fn [req]
     (let [uri    (:uri req)
           method (:request-method req)]
       (cond
         (and (= method :post) (= uri "/v1/chat/completions"))
-        (handle-chat-completions base-url req)
+        (handle-chat-completions req)
 
         (and (= method :post) (= uri "/v1/completions"))
-        (handle-completions base-url req)
+        (handle-completions req)
 
         (and (= method :get) (= uri "/v1/models"))
-        (handle-models base-url req)
+        (handle-models req)
 
         (and (= method :get) (= uri "/admin/health"))
-        (handle-health base-url req)
+        (handle-health req)
 
         :else
         (json-response 404 {:error {:message "Not found"
@@ -652,10 +681,34 @@
       (check "header override to grammar"
              (= :grammar (choose-strategy :ollama {"x-smar-strategy" "grammar"})))
 
+      (section "Smar fields extraction")
+      (let [parsed {:smar_target "http://localhost:1234"
+                    :smar_schema {"type" "object" "properties" {"x" {"type" "integer"}}}
+                    :model "test" :messages []}
+            result (extract-smar-fields parsed)]
+        (check "extracts target" (= "http://localhost:1234" (:target result)))
+        (check "extracts schema" (= {"type" "object" "properties" {"x" {"type" "integer"}}}
+                                    (:schema result)))
+        (check "strips smar fields from body"
+               (and (not (contains? (:body result) :smar_target))
+                    (not (contains? (:body result) :smar_schema))
+                    (= "test" (:model (:body result))))))
+      (let [parsed {:smar_target "http://localhost:1234" :model "test"}
+            result (extract-smar-fields parsed)]
+        (check "schema is nil when absent" (nil? (:schema result))))
+
       (section "Routing")
-      (let [handler (router "http://localhost:99999")]
-        (let [resp (handler {:uri "/nonexistent" :request-method :get})]
-          (check "404 for unknown route" (= 404 (:status resp)))))
+      (let [handler (router)]
+        (check "404 for unknown route"
+               (= 404 (:status (handler {:uri "/nonexistent" :request-method :get}))))
+        (check "400 when smar_target missing (chat)"
+               (= 400 (:status (handler {:uri "/v1/chat/completions"
+                                          :request-method :post
+                                          :body (java.io.ByteArrayInputStream.
+                                                 (.getBytes "{\"model\":\"test\",\"messages\":[]}"))}))))
+        (check "400 when target query missing (models)"
+               (= 400 (:status (handler {:uri "/v1/models"
+                                          :request-method :get})))))
 
       (tui-print)
       (let [p @pass f @fail t @total]
@@ -677,22 +730,16 @@
         (some #{"--self-test"} args)
         (run-self-test)
 
-        (= 2 (count args))
-        (let [server-port (Integer/parseInt (first args))
-              remote-port (Integer/parseInt (second args))
-              base-url    (str "http://localhost:" remote-port)]
-          (let [backend-type (with-spinner
-                               (str "probing backend at " base-url)
-                               #(probe-backend base-url))]
-            (reset! backend-state {:type backend-type :base-url base-url})
-            (print-banner server-port base-url backend-type)
-            (http/run-server (wrap-request-tracking (router base-url))
-                             {:port server-port :thread worker-threads})
-            @(promise)))
+        (= 1 (count args))
+        (let [server-port (Integer/parseInt (first args))]
+          (print-banner server-port)
+          (http/run-server (wrap-request-tracking (router))
+                           {:port server-port :thread worker-threads})
+          @(promise))
 
         :else
         (do
-          (tui-print (styled "Usage:" :bold) " bb smar.bb.clj <server-port> <remote-port>")
+          (tui-print (styled "Usage:" :bold) " bb smar.bb.clj <server-port>")
           (tui-print (styled "       " :bold) " bb smar.bb.clj --self-test")
           (System/exit 1)))
       (finally

@@ -4,7 +4,7 @@
 
 OpenAI-compatible proxy for local LLM backends. Single Babashka script, no config files.
 
-Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests/responses transparently.
+Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests/responses transparently. Target backend is specified per request via `smar_target` in the request body.
 
 ## Requirements
 
@@ -13,50 +13,53 @@ Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests
 ## Usage
 
 ```
-bb smar.bb.clj <server-port> <remote-port>
+bb smar.bb.clj <server-port>
 bb smar.bb.clj --self-test
 ```
 
 | Parameter | Description |
 |---|---|
 | `server-port` | Port smar listens on |
-| `remote-port` | Port of the LLM backend on localhost |
 | `--self-test` | Run inline tests and exit |
 
 ## Example
 
 ```bash
-# Proxy to Ollama on port 11434, expose OpenAI API on port 8080
-bb smar.bb.clj 8080 11434
+bb smar.bb.clj 8080
 ```
 
-Then use any OpenAI-compatible client:
+Then use any OpenAI-compatible client, adding `smar_target` to the request body:
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"llama3","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"hello"}]}'
+```
+
+For GET endpoints, pass the target as a query parameter:
+
+```bash
+curl http://localhost:8080/v1/models?target=http://localhost:11434
 ```
 
 ## Endpoints
 
-| Method | Path | Description |
+| Method | Path | Target via |
 |---|---|---|
-| POST | `/v1/chat/completions` | Chat completion |
-| POST | `/v1/completions` | Raw completion |
-| GET | `/v1/models` | List models |
-| GET | `/admin/health` | Backend health check |
+| POST | `/v1/chat/completions` | `smar_target` in body |
+| POST | `/v1/completions` | `smar_target` in body |
+| GET | `/v1/models` | `?target=` query param |
+| GET | `/admin/health` | `?target=` query param |
 
 ## Structured output
 
-Request JSON schema enforcement via `response_format` in the request body. Strategy is auto-selected based on backend capability (GBNF grammar injection or validate+retry). Override with the `x-smar-strategy` header (`grammar` or `validate`).
+Provide a JSON schema via `smar_schema` in the request body. Strategy is auto-selected based on backend capability (GBNF grammar injection or validate+retry). Override with the `x-smar-strategy` header (`grammar` or `validate`). OpenAI-style `response_format` is also supported as a fallback.
 
 ## Limitations
 
 - Grammar strategy (GBNF) trusts the backend to enforce structure — no post-validation
 - Streaming support is limited to Ollama passthrough
 - No authentication or rate limiting
-- Single backend only (one remote-port per instance)
 - Error handling for unreachable backends is minimal
 
 ## Documentation

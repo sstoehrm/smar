@@ -2,6 +2,12 @@
 
 All endpoints follow the OpenAI API format. Assume `http://localhost:<server-port>` as the base URL.
 
+Every request must specify a backend target:
+- **POST endpoints**: `smar_target` field in the JSON body (stripped before forwarding)
+- **GET endpoints**: `target` query parameter
+
+Backend type is auto-detected on first request to a given target and cached.
+
 ## POST /v1/chat/completions
 
 Chat completion. The primary endpoint.
@@ -10,6 +16,14 @@ Chat completion. The primary endpoint.
 
 ```json
 {
+  "smar_target": "http://localhost:11434",
+  "smar_schema": {
+    "type": "object",
+    "properties": {
+      "answer": {"type": "string"}
+    },
+    "required": ["answer"]
+  },
   "model": "llama3",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
@@ -17,30 +31,22 @@ Chat completion. The primary endpoint.
   ],
   "temperature": 0.7,
   "max_tokens": 512,
-  "stream": false,
-  "response_format": {
-    "type": "json_schema",
-    "json_schema": {
-      "schema": {
-        "type": "object",
-        "properties": {
-          "answer": {"type": "string"}
-        },
-        "required": ["answer"]
-      }
-    }
-  }
+  "stream": false
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `smar_target` | string | yes | Backend URL (e.g. `http://localhost:11434`) |
+| `smar_schema` | object | no | JSON Schema for structured output enforcement (see below) |
 | `model` | string | yes | Model name as reported by the backend |
 | `messages` | array | yes | Array of `{role, content}` message objects |
 | `temperature` | number | no | Sampling temperature |
 | `max_tokens` | integer | no | Max tokens to generate |
 | `stream` | boolean | no | Streaming (ollama only, default `false`) |
-| `response_format` | object | no | Structured output enforcement (see below) |
+| `response_format` | object | no | OpenAI-style structured output (fallback if `smar_schema` not set) |
+
+Both `smar_target` and `smar_schema` are stripped from the body before forwarding to the backend.
 
 **Response:**
 
@@ -68,6 +74,7 @@ Raw completion. Messages are formatted using a chat template (auto-detected from
 
 ```json
 {
+  "smar_target": "http://localhost:11434",
   "model": "llama3",
   "prompt": "Once upon a time",
   "temperature": 0.7,
@@ -77,6 +84,8 @@ Raw completion. Messages are formatted using a chat template (auto-detected from
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `smar_target` | string | yes | Backend URL |
+| `smar_schema` | object | no | JSON Schema for structured output |
 | `model` | string | yes | Model name |
 | `prompt` | string | yes | Raw prompt text |
 | `temperature` | number | no | Sampling temperature |
@@ -87,6 +96,10 @@ Raw completion. Messages are formatted using a chat template (auto-detected from
 ## GET /v1/models
 
 List available models from the backend.
+
+```
+GET /v1/models?target=http://localhost:11434
+```
 
 **Response:**
 
@@ -103,6 +116,10 @@ List available models from the backend.
 
 Backend health check.
 
+```
+GET /admin/health?target=http://localhost:11434
+```
+
 **Response:**
 
 ```json
@@ -115,7 +132,7 @@ Backend health check.
 
 ## Structured Output
 
-Request structured output by including `response_format` in the chat completions request body. Set `type` to `"json_schema"` and provide a JSON Schema under `json_schema.schema`.
+Request structured output by including `smar_schema` in the request body with a JSON Schema object. Alternatively, the OpenAI-style `response_format` field is supported as a fallback (set `type` to `"json_schema"` and provide a schema under `json_schema.schema`). If both are present, `smar_schema` takes precedence.
 
 smar picks a strategy automatically based on backend capability:
 
@@ -131,7 +148,7 @@ Override the strategy with the `x-smar-strategy` header:
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-smar-strategy: validate" \
-  -d '{"model":"llama3","messages":[{"role":"user","content":"give me a name and age"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}}}}'
+  -d '{"smar_target":"http://localhost:11434","smar_schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]},"model":"llama3","messages":[{"role":"user","content":"give me a name and age"}]}'
 ```
 
 When validation fails after all retries, the response includes a `smar_validation` field:
@@ -147,6 +164,14 @@ When validation fails after all retries, the response includes a `smar_validatio
 ```
 
 ## Errors
+
+Missing `smar_target` (POST) or `target` query param (GET):
+
+```json
+{"error": {"message": "Missing required field: smar_target", "type": "invalid_request_error"}}
+```
+
+with HTTP status `400`.
 
 Unknown routes return:
 

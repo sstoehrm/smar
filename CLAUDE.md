@@ -6,8 +6,8 @@ OpenAI-compatible API with structured output enforcement.
 ## Quick reference
 
 ```bash
-bb smar.bb.clj <server-port> <remote-port>   # start server
-bb smar.bb.clj --self-test                    # run inline tests
+bb smar.bb.clj <server-port>   # start server
+bb smar.bb.clj --self-test     # run inline tests
 ```
 
 ## Architecture
@@ -16,6 +16,7 @@ bb smar.bb.clj --self-test                    # run inline tests
 - Requires Babashka >= 1.12.215 (JLine3 for TUI)
 - Deps: malli (inline), httpkit + cheshire (bundled in bb)
 - Server: httpkit with configurable thread pool (`worker-threads` constant)
+- No fixed backend — target URL provided per-request via `smar_target` body field
 
 ## TUI (JLine3)
 
@@ -35,6 +36,7 @@ Server mode shows a startup banner + live colored request log.
 ## Backend detection
 
 Auto-detects by probing: `/api/tags` → ollama, `/api/v1/model` → koboldcpp, else → llamacpp.
+Detection is cached per target URL in `backend-cache` atom.
 Translation via multimethods: `translate-request`, `translate-response`, `list-models-remote`.
 
 ## Structured output
