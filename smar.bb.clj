@@ -620,7 +620,7 @@
         (let [ollama (translate-request :ollama req)]
           (check "ollama url" (= "/api/chat" (:url ollama)))
           (check "ollama passes messages" (= [{:role "user" :content "hi"}]
-                                              (get-in ollama [:body :messages])))
+                                             (get-in ollama [:body :messages])))
           (check "ollama maps temperature" (= 0.5 (get-in ollama [:body :options :temperature]))))
         (let [kobold (translate-request :koboldcpp req)]
           (check "koboldcpp url" (= "/api/v1/generate" (:url kobold)))
@@ -632,15 +632,15 @@
       (section "Response translation")
       (let [resp {:body (json/generate-string
                          {:model "llama3"
-                          :message {:role "assistant" :content "hello back"}})}]
-        (let [result (translate-response :ollama resp)]
+                          :message {:role "assistant" :content "hello back"}})}
+            result (translate-response :ollama resp)]
           (check "ollama response has choices"
-                 (= "hello back" (get-in result [:choices 0 :message :content])))))
+                 (= "hello back" (get-in result [:choices 0 :message :content]))))
       (let [resp {:body (json/generate-string
-                         {:results [{:text "kobold says hi"}]})}]
-        (let [result (translate-response :koboldcpp resp)]
+                         {:results [{:text "kobold says hi"}]})}
+            result (translate-response :koboldcpp resp)]
           (check "koboldcpp response extracts text"
-                 (= "kobold says hi" (get-in result [:choices 0 :message :content])))))
+                 (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
       (check "grammar when supported"
