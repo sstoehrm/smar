@@ -18,6 +18,21 @@ bb smar.bb.clj --self-test     # run inline tests
 - Server: httpkit with configurable thread pool (`worker-threads` constant)
 - No fixed backend — target URL provided per-request via `smar_target` body field
 
+## API surface
+
+Two endpoints, both POST with JSON body:
+
+- `POST /smar/complete` — unified completion (plain, JSON schema, tool calling)
+- `POST /smar/models` — list models from a backend
+
+All requests include `smar_target` in the body. The complete endpoint mode is
+determined by which smar fields are present:
+
+- Nothing extra → plain completion
+- `smar_schema` → structured JSON output (GBNF or validate+retry)
+- `smar_tools` → enforce valid tool call response (validate+retry)
+- Both `smar_schema` + `smar_tools` → 400 error (mutually exclusive)
+
 ## TUI (JLine3)
 
 Terminal output uses JLine3 `AttributedStringBuilder` for styled/colored text.
@@ -43,6 +58,12 @@ Translation via multimethods: `translate-request`, `translate-response`, `list-m
 
 Two strategies: GBNF grammar injection (llamacpp, koboldcpp) or validate+retry with malli (ollama).
 Override via `x-smar-strategy` header.
+
+## Tool calling
+
+smar enforces that the LLM produces a valid tool call (correct tool name, valid arguments
+matching the tool's parameter schema). It does NOT execute tools — it validates and retries
+until the LLM response is a well-formed tool call, then returns it to the client.
 
 ## Docs
 

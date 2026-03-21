@@ -15,8 +15,7 @@
          '[cheshire.core :as json]
          '[clojure.string :as str]
          '[malli.core :as m]
-         '[malli.error :as me]
-         '[malli.json-schema :as mjs])
+         '[malli.error :as me])
 
 (import '[org.jline.terminal TerminalBuilder]
         '[org.jline.utils AttributedStringBuilder AttributedStyle])
@@ -80,7 +79,7 @@
 
 (def request-stats (atom {:total 0 :active 0 :errors 0 :last-requests []}))
 
-(defn track-request-start [method uri]
+(defn track-request-start [_method _uri]
   (swap! request-stats (fn [s]
                          (-> s
                              (update :total inc)
@@ -138,7 +137,6 @@
 (defn with-spinner [message work-fn]
   (let [frames  (spinner-frames)
         running (atom true)
-        result  (promise)
         spin-thread (Thread.
                      (fn []
                        (loop [i 0]
@@ -170,10 +168,8 @@
   (tui-print (styled "  backend  " :dim) (styled "per-request via smar_target" :dim))
   (tui-print)
   (tui-print (styled "  Endpoints:" :dim))
-  (tui-print (styled "    POST " :cyan) "/v1/chat/completions")
-  (tui-print (styled "    POST " :cyan) "/v1/completions")
-  (tui-print (styled "    GET  " :cyan) "/v1/models" (styled "?target=..." :dim))
-  (tui-print (styled "    GET  " :cyan) "/admin/health" (styled "?target=..." :dim))
+  (tui-print (styled "    POST " :cyan) "/smar/complete")
+  (tui-print (styled "    POST " :cyan) "/smar/models")
   (tui-print)
   (tui-print (styled "  Ctrl-C to stop" :dim))
   (tui-print))
@@ -290,6 +286,68 @@
          :errors (me/humanize (m/explain schema data))}))
     (catch Exception e
       {:valid false :errors (str "JSON parse error: " (.getMessage e))})))
+
+;; ---------------------------------------------------------------------------
+;; Tool call validation
+;; ---------------------------------------------------------------------------
+
+(defn build-tools-system-prompt [tools]
+  (str "You have access to the following tools:\n\n"
+       (str/join "\n\n"
+                 (map (fn [tool]
+                        (str "Tool: " (get tool "name" (get tool :name)) "\n"
+                             "Description: " (get tool "description" (get tool :description)) "\n"
+                             "Parameters: " (json/generate-string
+                                             (get tool "parameters" (get tool :parameters)))))
+                      tools))
+       "\n\nYou MUST respond with a JSON object in this exact format:\n"
+       "{\"name\": \"<tool_name>\", \"arguments\": {<args matching the tool's parameters>}}\n"
+       "Do NOT include any other text. Only output the JSON tool call."))
+
+(defn validate-tool-call [tools response-str]
+  (try
+    (let [data       (json/parse-string response-str true)
+          tool-name  (:name data)
+          arguments  (:arguments data)
+          tools-map  (into {} (map (fn [t]
+                                     [(get t "name" (get t :name)) t])
+                                   tools))]
+      (cond
+        (nil? tool-name)
+        {:valid false :errors "Response missing 'name' field"}
+
+        (not (contains? tools-map tool-name))
+        {:valid false :errors (str "Unknown tool: " tool-name
+                                   ". Available: " (str/join ", " (keys tools-map)))}
+
+        (nil? arguments)
+        {:valid false :errors "Response missing 'arguments' field"}
+
+        :else
+        (let [tool       (get tools-map tool-name)
+              params     (get tool "parameters" (get tool :parameters))
+              malli-schema (when params (json-schema->malli params))]
+          (if (or (nil? malli-schema) (m/validate malli-schema arguments))
+            {:valid true :tool-call {:name tool-name :arguments arguments}}
+            {:valid false
+             :errors (str "Invalid arguments for " tool-name ": "
+                          (pr-str (me/humanize (m/explain malli-schema arguments))))}))))
+    (catch Exception e
+      {:valid false :errors (str "Failed to parse tool call JSON: " (.getMessage e))})))
+
+(defn tool-call-response [model tool-call]
+  {:id      (str "smar-" (System/currentTimeMillis))
+   :object  "chat.completion"
+   :created (quot (System/currentTimeMillis) 1000)
+   :model   model
+   :choices [{:index         0
+              :message       {:role       "assistant"
+                              :tool_calls [{:id       (str "call_" (System/currentTimeMillis))
+                                            :type     "function"
+                                            :function {:name      (:name tool-call)
+                                                       :arguments (json/generate-string
+                                                                   (:arguments tool-call))}}]}
+              :finish_reason "tool_calls"}]})
 
 ;; ---------------------------------------------------------------------------
 ;; Backend detection & translation
@@ -444,6 +502,29 @@
                                       "Errors: " (pr-str (:errors validation)) "\n"
                                       "Please try again and respond with valid JSON.")})))))))
 
+(defn complete-with-tool-validation [base-url backend-type req tools max-retries]
+  (loop [attempt 0
+         messages (:messages req)]
+    (let [current-req  (assoc req :messages messages)
+          translated   (translate-request backend-type current-req)
+          raw-resp     (forward-request base-url translated)
+          openai-resp  (translate-response backend-type raw-resp)
+          content      (get-in openai-resp [:choices 0 :message :content] "")
+          validation   (validate-tool-call tools content)]
+      (if (:valid validation)
+        (tool-call-response (:model req) (:tool-call validation))
+        (if (>= attempt max-retries)
+          (assoc openai-resp
+                 :smar_validation {:valid false :errors (:errors validation)})
+          (recur (inc attempt)
+                 (conj (vec messages)
+                       {:role "assistant" :content content}
+                       {:role "user"
+                        :content (str "Your response was not a valid tool call. "
+                                      "Error: " (:errors validation) "\n"
+                                      "You MUST respond with ONLY a JSON object: "
+                                      "{\"name\": \"<tool_name>\", \"arguments\": {...}}")})))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Request handling
 ;; ---------------------------------------------------------------------------
@@ -462,88 +543,67 @@
 
 (defn extract-smar-fields [parsed-body]
   (let [target (:smar_target parsed-body)
-        schema (:smar_schema parsed-body)]
+        schema (:smar_schema parsed-body)
+        tools  (:smar_tools parsed-body)]
     (when target
       {:target target
        :schema schema
-       :body   (dissoc parsed-body :smar_target :smar_schema)})))
+       :tools  tools
+       :body   (dissoc parsed-body :smar_target :smar_schema :smar_tools)})))
 
-(defn extract-target-from-query [req]
-  (when-let [qs (:query-string req)]
-    (some (fn [pair]
-            (let [[k v] (str/split pair #"=" 2)]
-              (when (= k "target") v)))
-          (str/split qs #"&"))))
+(defn inject-tools-prompt [messages tools]
+  (let [system-msg {:role "system" :content (build-tools-system-prompt tools)}]
+    (vec (cons system-msg messages))))
 
-(defn get-response-schema [openai-req]
-  (when-let [rf (:response_format openai-req)]
-    (when (= (:type rf) "json_schema")
-      (or (:schema rf)
-          (get-in rf [:json_schema :schema])))))
-
-(defn handle-chat-completions [req]
+(defn handle-complete [req]
   (let [parsed (parse-body req)]
-    (if-let [{:keys [target schema body]} (extract-smar-fields parsed)]
-      (let [backend      (get-backend target)
-            backend-type (:type backend)
-            openai-req   body
-            json-schema  (or schema (get-response-schema openai-req))
-            headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
-                                       (:headers req)))
-            strategy     (when json-schema
-                           (choose-strategy backend-type headers))]
-        (cond
-          (= strategy :grammar)
-          (let [translated (-> (translate-request backend-type openai-req)
-                               (inject-grammar json-schema))
-                raw-resp   (forward-request target translated)
-                response   (translate-response backend-type raw-resp)]
-            (json-response 200 response))
+    (if-let [{:keys [target schema tools body]} (extract-smar-fields parsed)]
+      (cond
+        (and schema tools)
+        (error-response 400 "smar_schema and smar_tools are mutually exclusive")
 
-          (= strategy :validate)
-          (let [response (complete-with-validation
-                          target backend-type openai-req json-schema 3)]
-            (json-response 200 response))
+        tools
+        (let [backend      (get-backend target)
+              backend-type (:type backend)
+              openai-req   (update body :messages inject-tools-prompt tools)]
+          (complete-with-tool-validation target backend-type openai-req tools 3))
 
-          :else
-          (let [translated (translate-request backend-type openai-req)
-                raw-resp   (forward-request target translated)
-                response   (translate-response backend-type raw-resp)]
-            (json-response 200 response))))
-      (error-response 400 "Missing required field: smar_target"))))
+        schema
+        (let [backend      (get-backend target)
+              backend-type (:type backend)
+              openai-req   body
+              headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
+                                         (:headers req)))
+              strategy     (choose-strategy backend-type headers)]
+          (cond
+            (= strategy :grammar)
+            (let [translated (-> (translate-request backend-type openai-req)
+                                 (inject-grammar schema))
+                  raw-resp   (forward-request target translated)
+                  response   (translate-response backend-type raw-resp)]
+              (json-response 200 response))
 
-(defn handle-completions [req]
-  (let [parsed (parse-body req)]
-    (if-let [{:keys [target body]} (extract-smar-fields parsed)]
-      (let [backend      (get-backend target)
-            backend-type (:type backend)
-            openai-req   body
-            template-key (detect-template-from-model (:model openai-req))
-            prompt       (or (:prompt openai-req)
-                             (apply-template template-key
-                                             [{:role "user" :content (:prompt openai-req "")}]))
-            translated   (translate-request backend-type
-                                             (assoc openai-req
-                                                    :messages [{:role "user" :content prompt}]))
-            raw-resp     (forward-request target translated)
-            response     (translate-response backend-type raw-resp)]
-        (json-response 200 response))
+            :else
+            (let [response (complete-with-validation
+                            target backend-type openai-req schema 3)]
+              (json-response 200 response))))
+
+        :else
+        (let [backend      (get-backend target)
+              backend-type (:type backend)
+              translated   (translate-request backend-type body)
+              raw-resp     (forward-request target translated)
+              response     (translate-response backend-type raw-resp)]
+          (json-response 200 response)))
       (error-response 400 "Missing required field: smar_target"))))
 
 (defn handle-models [req]
-  (if-let [target (extract-target-from-query req)]
-    (let [backend (get-backend target)
-          models  (list-models-remote (:type backend) target)]
-      (json-response 200 {:object "list" :data models}))
-    (error-response 400 "Missing required query parameter: target")))
-
-(defn handle-health [req]
-  (if-let [target (extract-target-from-query req)]
-    (let [backend (get-backend target)]
-      (json-response 200 {:status "ok"
-                          :backend_type (name (:type backend))
-                          :base_url target}))
-    (error-response 400 "Missing required query parameter: target")))
+  (let [parsed (parse-body req)]
+    (if-let [target (:smar_target parsed)]
+      (let [backend (get-backend target)
+            models  (list-models-remote (:type backend) target)]
+        (json-response 200 {:object "list" :data models}))
+      (error-response 400 "Missing required field: smar_target"))))
 
 (defn wrap-request-tracking [handler]
   (fn [req]
@@ -563,28 +623,22 @@
             (track-request-end method uri 500 latency)
             (log-request method uri 500 latency)
             (json-response 500 {:error {:message (.getMessage e)
-                                         :type "internal_error"}})))))))
+                                        :type "internal_error"}})))))))
 
 (defn router []
   (fn [req]
     (let [uri    (:uri req)
           method (:request-method req)]
       (cond
-        (and (= method :post) (= uri "/v1/chat/completions"))
-        (handle-chat-completions req)
+        (and (= method :post) (= uri "/smar/complete"))
+        (handle-complete req)
 
-        (and (= method :post) (= uri "/v1/completions"))
-        (handle-completions req)
-
-        (and (= method :get) (= uri "/v1/models"))
+        (and (= method :post) (= uri "/smar/models"))
         (handle-models req)
-
-        (and (= method :get) (= uri "/admin/health"))
-        (handle-health req)
 
         :else
         (json-response 404 {:error {:message "Not found"
-                                     :type "invalid_request_error"}})))))
+                                    :type "invalid_request_error"}})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Self-test
@@ -624,8 +678,8 @@
 
       (section "GBNF generation")
       (let [gbnf (json-schema->gbnf {"type" "object"
-                                      "properties" {"name" {"type" "string"}
-                                                    "age"  {"type" "integer"}}})]
+                                     "properties" {"name" {"type" "string"}
+                                                   "age"  {"type" "integer"}}})]
         (check "gbnf has root rule" (str/includes? gbnf "root ::="))
         (check "gbnf has ws rule" (str/includes? gbnf "ws ::="))
         (check "gbnf references name field" (str/includes? gbnf "name"))
@@ -642,6 +696,45 @@
                (not (:valid (validate-response schema "{\"name\":\"Alice\",\"age\":\"old\"}"))))
         (check "malformed json fails"
                (not (:valid (validate-response schema "not json")))))
+
+      (section "Tool call validation")
+      (let [tools [{"name" "get_weather"
+                    "description" "Get weather"
+                    "parameters" {"type" "object"
+                                  "properties" {"city" {"type" "string"}}
+                                  "required" ["city"]}}
+                   {"name" "search"
+                    "description" "Search the web"
+                    "parameters" {"type" "object"
+                                  "properties" {"query" {"type" "string"}}
+                                  "required" ["query"]}}]]
+        (check "valid tool call"
+               (:valid (validate-tool-call tools
+                         "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Berlin\"}}")))
+        (check "wrong tool name"
+               (not (:valid (validate-tool-call tools
+                              "{\"name\":\"unknown\",\"arguments\":{}}"))))
+        (check "invalid arguments"
+               (not (:valid (validate-tool-call tools
+                              "{\"name\":\"get_weather\",\"arguments\":{\"city\":123}}"))))
+        (check "missing name field"
+               (not (:valid (validate-tool-call tools
+                              "{\"arguments\":{\"city\":\"Berlin\"}}"))))
+        (check "missing arguments field"
+               (not (:valid (validate-tool-call tools
+                              "{\"name\":\"get_weather\"}"))))
+        (check "not json"
+               (not (:valid (validate-tool-call tools
+                              "I'll help you with the weather!"))))
+        (check "valid second tool"
+               (:valid (validate-tool-call tools
+                         "{\"name\":\"search\",\"arguments\":{\"query\":\"weather Berlin\"}}"))))
+
+      (section "Tools system prompt")
+      (let [tools  [{"name" "test_tool" "description" "A test" "parameters" {"type" "object"}}]
+            prompt (build-tools-system-prompt tools)]
+        (check "prompt mentions tool name" (str/includes? prompt "test_tool"))
+        (check "prompt mentions JSON format" (str/includes? prompt "\"name\"")))
 
       (section "Request translation")
       (let [req {:model "llama3" :messages [{:role "user" :content "hi"}]
@@ -663,13 +756,13 @@
                          {:model "llama3"
                           :message {:role "assistant" :content "hello back"}})}
             result (translate-response :ollama resp)]
-          (check "ollama response has choices"
-                 (= "hello back" (get-in result [:choices 0 :message :content]))))
+        (check "ollama response has choices"
+               (= "hello back" (get-in result [:choices 0 :message :content]))))
       (let [resp {:body (json/generate-string
                          {:results [{:text "kobold says hi"}]})}
             result (translate-response :koboldcpp resp)]
-          (check "koboldcpp response extracts text"
-                 (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
+        (check "koboldcpp response extracts text"
+               (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
       (check "grammar when supported"
@@ -683,32 +776,43 @@
 
       (section "Smar fields extraction")
       (let [parsed {:smar_target "http://localhost:1234"
-                    :smar_schema {"type" "object" "properties" {"x" {"type" "integer"}}}
+                    :smar_schema {"type" "object"}
+                    :smar_tools  [{"name" "t"}]
                     :model "test" :messages []}
             result (extract-smar-fields parsed)]
         (check "extracts target" (= "http://localhost:1234" (:target result)))
-        (check "extracts schema" (= {"type" "object" "properties" {"x" {"type" "integer"}}}
-                                    (:schema result)))
+        (check "extracts schema" (= {"type" "object"} (:schema result)))
+        (check "extracts tools" (= [{"name" "t"}] (:tools result)))
         (check "strips smar fields from body"
                (and (not (contains? (:body result) :smar_target))
                     (not (contains? (:body result) :smar_schema))
+                    (not (contains? (:body result) :smar_tools))
                     (= "test" (:model (:body result))))))
-      (let [parsed {:smar_target "http://localhost:1234" :model "test"}
-            result (extract-smar-fields parsed)]
-        (check "schema is nil when absent" (nil? (:schema result))))
 
       (section "Routing")
       (let [handler (router)]
         (check "404 for unknown route"
                (= 404 (:status (handler {:uri "/nonexistent" :request-method :get}))))
-        (check "400 when smar_target missing (chat)"
-               (= 400 (:status (handler {:uri "/v1/chat/completions"
+        (check "400 when smar_target missing"
+               (= 400 (:status (handler {:uri "/smar/complete"
                                           :request-method :post
                                           :body (java.io.ByteArrayInputStream.
                                                  (.getBytes "{\"model\":\"test\",\"messages\":[]}"))}))))
-        (check "400 when target query missing (models)"
-               (= 400 (:status (handler {:uri "/v1/models"
-                                          :request-method :get})))))
+        (check "400 when schema+tools both present"
+               (let [body (json/generate-string {:smar_target "http://localhost:1234"
+                                                  :smar_schema {"type" "object"}
+                                                  :smar_tools [{"name" "t"}]
+                                                  :model "test"
+                                                  :messages []})
+                     resp (handler {:uri "/smar/complete"
+                                    :request-method :post
+                                    :body (java.io.ByteArrayInputStream. (.getBytes body))})]
+                 (= 400 (:status resp))))
+        (check "400 when smar_target missing (models)"
+               (= 400 (:status (handler {:uri "/smar/models"
+                                          :request-method :post
+                                          :body (java.io.ByteArrayInputStream.
+                                                 (.getBytes "{}"))})))))
 
       (tui-print)
       (let [p @pass f @fail t @total]

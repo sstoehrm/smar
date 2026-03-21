@@ -28,32 +28,56 @@ bb smar.bb.clj --self-test
 bb smar.bb.clj 8080
 ```
 
-Then use any OpenAI-compatible client, adding `smar_target` to the request body:
+**Plain completion:**
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl -X POST http://localhost:8080/smar/complete \
   -H "Content-Type: application/json" \
   -d '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-For GET endpoints, pass the target as a query parameter:
+**Structured JSON output:**
 
 ```bash
-curl http://localhost:8080/v1/models?target=http://localhost:11434
+curl -X POST http://localhost:8080/smar/complete \
+  -H "Content-Type: application/json" \
+  -d '{"smar_target":"http://localhost:11434","smar_schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},"model":"llama3","messages":[{"role":"user","content":"give me a name"}]}'
+```
+
+**Tool calling:**
+
+```bash
+curl -X POST http://localhost:8080/smar/complete \
+  -H "Content-Type: application/json" \
+  -d '{"smar_target":"http://localhost:11434","smar_tools":[{"name":"get_weather","description":"Get weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"model":"llama3","messages":[{"role":"user","content":"What is the weather in Berlin?"}]}'
+```
+
+**List models:**
+
+```bash
+curl -X POST http://localhost:8080/smar/models \
+  -H "Content-Type: application/json" \
+  -d '{"smar_target":"http://localhost:11434"}'
 ```
 
 ## Endpoints
 
-| Method | Path | Target via |
+| Method | Path | Description |
 |---|---|---|
-| POST | `/v1/chat/completions` | `smar_target` in body |
-| POST | `/v1/completions` | `smar_target` in body |
-| GET | `/v1/models` | `?target=` query param |
-| GET | `/admin/health` | `?target=` query param |
+| POST | `/smar/complete` | Completion (plain, JSON schema, or tool call) |
+| POST | `/smar/models` | List models from a backend |
 
-## Structured output
+## Modes
 
-Provide a JSON schema via `smar_schema` in the request body. Strategy is auto-selected based on backend capability (GBNF grammar injection or validate+retry). Override with the `x-smar-strategy` header (`grammar` or `validate`). OpenAI-style `response_format` is also supported as a fallback.
+The `/smar/complete` endpoint mode is determined by which fields are present:
+
+| Field | Mode | Description |
+|---|---|---|
+| (none) | plain | Direct completion, response passed through |
+| `smar_schema` | JSON | Enforce structured output via GBNF grammar or validate+retry |
+| `smar_tools` | tools | Enforce valid tool call response, retry if invalid |
+
+`smar_schema` and `smar_tools` are mutually exclusive.
 
 ## Limitations
 
@@ -61,6 +85,7 @@ Provide a JSON schema via `smar_schema` in the request body. Strategy is auto-se
 - Streaming support is limited to Ollama passthrough
 - No authentication or rate limiting
 - Error handling for unreachable backends is minimal
+- Tool calling: smar enforces format only, does not execute tools
 
 ## Documentation
 
