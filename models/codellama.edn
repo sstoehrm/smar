@@ -1,0 +1,8 @@
+{:family      "codellama"
+ :template    :llama3
+ :defaults    {:temperature    0.2
+               :top_p          0.9
+               :top_k          10
+               :repeat_penalty 1.0
+               :max_tokens     2048}
+ :description "Meta CodeLlama family"}

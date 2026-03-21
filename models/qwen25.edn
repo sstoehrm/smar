@@ -1,0 +1,8 @@
+{:family      "qwen25"
+ :template    :chatml
+ :defaults    {:temperature    0.7
+               :top_p          0.9
+               :top_k          40
+               :repeat_penalty 1.18
+               :max_tokens     2048}
+ :description "Alibaba Qwen 2.5 family"}

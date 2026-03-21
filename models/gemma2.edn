@@ -1,0 +1,8 @@
+{:family      "gemma2"
+ :template    :chatml
+ :defaults    {:temperature    1.0
+               :top_p          0.95
+               :top_k          64
+               :repeat_penalty 1.0
+               :max_tokens     2048}
+ :description "Google Gemma 2 family"}

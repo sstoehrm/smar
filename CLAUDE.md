@@ -31,7 +31,15 @@ determined by which smar fields are present:
 - Nothing extra → plain completion
 - `smar_schema` → structured JSON output (GBNF or validate+retry)
 - `smar_tools` → enforce valid tool call response (validate+retry)
+- `smar_model_family` → apply preset defaults (temperature, top_p, top_k, repeat_penalty, template)
 - Both `smar_schema` + `smar_tools` → 400 error (mutually exclusive)
+
+## Model presets
+
+EDN files in `models/` directory, loaded at startup into `model-presets` map.
+Each file: `{:family "name" :template :key :defaults {:temperature ...} :description "..."}`.
+`apply-model-preset` merges defaults under explicit request fields (request wins).
+`get-preset-template` returns the template key for koboldcpp translation.
 
 ## TUI (JLine3)
 

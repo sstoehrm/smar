@@ -14,6 +14,8 @@
          '[org.httpkit.client :as client]
          '[cheshire.core :as json]
          '[clojure.string :as str]
+         '[clojure.edn :as edn]
+         '[clojure.java.io :as io]
          '[malli.core :as m]
          '[malli.error :as me])
 
@@ -127,6 +129,31 @@
 ;; ---------------------------------------------------------------------------
 
 (def worker-threads 4)
+
+;; ---------------------------------------------------------------------------
+;; Model presets
+;; ---------------------------------------------------------------------------
+
+(defn load-model-presets []
+  (let [dir (io/file "models")]
+    (if (.isDirectory dir)
+      (into {}
+            (for [f (.listFiles dir)
+                  :when (str/ends-with? (.getName f) ".edn")]
+              (let [data (edn/read-string (slurp f))]
+                [(:family data) data])))
+      {})))
+
+(def model-presets (load-model-presets))
+
+(defn apply-model-preset [openai-req model-family]
+  (if-let [preset (get model-presets model-family)]
+    (merge (:defaults preset) openai-req)
+    openai-req))
+
+(defn get-preset-template [model-family]
+  (when-let [preset (get model-presets model-family)]
+    (:template preset)))
 
 ;; ---------------------------------------------------------------------------
 ;; TUI — startup display
@@ -385,16 +412,22 @@
             :messages (:messages req)
             :stream   (get req :stream false)
             :options  (cond-> {}
-                        (:temperature req) (assoc :temperature (:temperature req))
-                        (:max_tokens req)  (assoc :num_predict (:max_tokens req)))}})
+                        (:temperature req)    (assoc :temperature (:temperature req))
+                        (:max_tokens req)     (assoc :num_predict (:max_tokens req))
+                        (:top_p req)          (assoc :top_p (:top_p req))
+                        (:top_k req)          (assoc :top_k (:top_k req))
+                        (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}})
 
 (defmethod translate-request :koboldcpp [_ req]
-  (let [template-key (detect-template-from-model (:model req))
+  (let [template-key (or (:smar_template req) (detect-template-from-model (:model req)))
         prompt       (apply-template template-key (:messages req))]
     {:url  "/api/v1/generate"
      :body (cond-> {:prompt     prompt
                     :max_length (or (:max_tokens req) 512)}
-             (:temperature req) (assoc :temperature (:temperature req)))}))
+             (:temperature req)    (assoc :temperature (:temperature req))
+             (:top_p req)          (assoc :top_p (:top_p req))
+             (:top_k req)          (assoc :top_k (:top_k req))
+             (:repeat_penalty req) (assoc :rep_pen (:repeat_penalty req)))}))
 
 (defmethod translate-request :llamacpp [_ req]
   {:url  "/v1/chat/completions"
@@ -542,22 +575,31 @@
   (json-response status {:error {:message message :type "invalid_request_error"}}))
 
 (defn extract-smar-fields [parsed-body]
-  (let [target (:smar_target parsed-body)
-        schema (:smar_schema parsed-body)
-        tools  (:smar_tools parsed-body)]
+  (let [target       (:smar_target parsed-body)
+        schema       (:smar_schema parsed-body)
+        tools        (:smar_tools parsed-body)
+        model-family (:smar_model_family parsed-body)]
     (when target
-      {:target target
-       :schema schema
-       :tools  tools
-       :body   (dissoc parsed-body :smar_target :smar_schema :smar_tools)})))
+      {:target       target
+       :schema       schema
+       :tools        tools
+       :model-family model-family
+       :body         (dissoc parsed-body :smar_target :smar_schema :smar_tools :smar_model_family)})))
 
 (defn inject-tools-prompt [messages tools]
   (let [system-msg {:role "system" :content (build-tools-system-prompt tools)}]
     (vec (cons system-msg messages))))
 
+(defn prepare-request [body model-family]
+  (let [preset-template (get-preset-template model-family)
+        req             (apply-model-preset body model-family)]
+    (if preset-template
+      (assoc req :smar_template preset-template)
+      req)))
+
 (defn handle-complete [req]
   (let [parsed (parse-body req)]
-    (if-let [{:keys [target schema tools body]} (extract-smar-fields parsed)]
+    (if-let [{:keys [target schema tools model-family body]} (extract-smar-fields parsed)]
       (cond
         (and schema tools)
         (error-response 400 "smar_schema and smar_tools are mutually exclusive")
@@ -565,13 +607,14 @@
         tools
         (let [backend      (get-backend target)
               backend-type (:type backend)
-              openai-req   (update body :messages inject-tools-prompt tools)]
+              openai-req   (-> (prepare-request body model-family)
+                               (update :messages inject-tools-prompt tools))]
           (complete-with-tool-validation target backend-type openai-req tools 3))
 
         schema
         (let [backend      (get-backend target)
               backend-type (:type backend)
-              openai-req   body
+              openai-req   (prepare-request body model-family)
               headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
                                          (:headers req)))
               strategy     (choose-strategy backend-type headers)]
@@ -591,7 +634,8 @@
         :else
         (let [backend      (get-backend target)
               backend-type (:type backend)
-              translated   (translate-request backend-type body)
+              openai-req   (prepare-request body model-family)
+              translated   (translate-request backend-type openai-req)
               raw-resp     (forward-request target translated)
               response     (translate-response backend-type raw-resp)]
           (json-response 200 response)))
@@ -774,19 +818,42 @@
       (check "header override to grammar"
              (= :grammar (choose-strategy :ollama {"x-smar-strategy" "grammar"})))
 
+      (section "Model presets")
+      (check "presets loaded" (pos? (count model-presets)))
+      (check "llama3 preset exists" (contains? model-presets "llama3"))
+      (check "llama3 preset has temperature"
+             (= 0.6 (get-in model-presets ["llama3" :defaults :temperature])))
+      (check "llama3 preset has template"
+             (= :llama3 (get-in model-presets ["llama3" :template])))
+      (let [req {:model "test" :messages [] :temperature 0.9}
+            result (apply-model-preset req "llama3")]
+        (check "preset applies defaults" (= 0.9 (get-in result [:top_p])))
+        (check "request overrides preset" (= 0.9 (:temperature result))))
+      (let [req {:model "test" :messages []}
+            result (apply-model-preset req "llama3")]
+        (check "preset fills missing temperature" (= 0.6 (:temperature result))))
+      (let [req {:model "test"}
+            result (apply-model-preset req "nonexistent")]
+        (check "unknown family returns unchanged" (= req result)))
+      (check "preset template for llama3" (= :llama3 (get-preset-template "llama3")))
+      (check "preset template for unknown is nil" (nil? (get-preset-template "nonexistent")))
+
       (section "Smar fields extraction")
       (let [parsed {:smar_target "http://localhost:1234"
                     :smar_schema {"type" "object"}
                     :smar_tools  [{"name" "t"}]
+                    :smar_model_family "llama3"
                     :model "test" :messages []}
             result (extract-smar-fields parsed)]
         (check "extracts target" (= "http://localhost:1234" (:target result)))
         (check "extracts schema" (= {"type" "object"} (:schema result)))
         (check "extracts tools" (= [{"name" "t"}] (:tools result)))
+        (check "extracts model-family" (= "llama3" (:model-family result)))
         (check "strips smar fields from body"
                (and (not (contains? (:body result) :smar_target))
                     (not (contains? (:body result) :smar_schema))
                     (not (contains? (:body result) :smar_tools))
+                    (not (contains? (:body result) :smar_model_family))
                     (= "test" (:model (:body result))))))
 
       (section "Routing")

@@ -79,6 +79,16 @@ The `/smar/complete` endpoint mode is determined by which fields are present:
 
 `smar_schema` and `smar_tools` are mutually exclusive.
 
+## Model families
+
+Use `smar_model_family` to apply recommended defaults (temperature, top_p, top_k, repeat_penalty) for a model family. Explicit request fields override preset values.
+
+```json
+{"smar_target": "...", "smar_model_family": "llama3", "model": "llama3:8b", "messages": [...]}
+```
+
+Available families: `llama3`, `mistral`, `gemma2`, `phi4`, `qwen25`, `qwen3`, `qwen35`, `deepseek`, `command-r`, `codellama`, `default`. Presets are defined as EDN files in the `models/` directory.
+
 ## Limitations
 
 - Grammar strategy (GBNF) trusts the backend to enforce structure — no post-validation

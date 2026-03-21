@@ -1,0 +1,8 @@
+{:family      "phi4"
+ :template    :chatml
+ :defaults    {:temperature    0.0
+               :top_p          0.95
+               :top_k          40
+               :repeat_penalty 1.0
+               :max_tokens     2048}
+ :description "Microsoft Phi-4 family"}

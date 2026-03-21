@@ -72,11 +72,15 @@ Unified completion endpoint. Mode determined by request body fields.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `smar_target` | string | yes | Backend URL (e.g. `http://localhost:11434`) |
+| `smar_model_family` | string | no | Model family preset (e.g. `llama3`, `mistral`, `qwen3`) |
 | `smar_schema` | object | no | JSON Schema for structured output enforcement |
 | `smar_tools` | array | no | Tool definitions for tool call enforcement |
 | `model` | string | yes | Model name as reported by the backend |
 | `messages` | array | yes | Array of `{role, content}` message objects |
 | `temperature` | number | no | Sampling temperature |
+| `top_p` | number | no | Nucleus sampling threshold |
+| `top_k` | integer | no | Top-k sampling |
+| `repeat_penalty` | number | no | Repetition penalty |
 | `max_tokens` | integer | no | Max tokens to generate |
 
 `smar_schema` and `smar_tools` are mutually exclusive. If both are present, the request returns 400.
