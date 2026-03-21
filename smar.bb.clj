@@ -128,6 +128,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
+(def smar-version "0.1.0")
 (def worker-threads 4)
 
 ;; ---------------------------------------------------------------------------
@@ -898,6 +899,9 @@
   (binding [*terminal* (create-terminal)]
     (try
       (cond
+        (some #{"--version"} args)
+        (tui-print (str "smar " smar-version))
+
         (some #{"--self-test"} args)
         (run-self-test)
 
@@ -912,6 +916,7 @@
         (do
           (tui-print (styled "Usage:" :bold) " bb smar.bb.clj <server-port>")
           (tui-print (styled "       " :bold) " bb smar.bb.clj --self-test")
+          (tui-print (styled "       " :bold) " bb smar.bb.clj --version")
           (System/exit 1)))
       (finally
         (.close *terminal*)))))

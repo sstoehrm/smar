@@ -8,7 +8,14 @@ OpenAI-compatible API with structured output enforcement.
 ```bash
 bb smar.bb.clj <server-port>   # start server
 bb smar.bb.clj --self-test     # run inline tests
+bb smar.bb.clj --version       # print version
 ```
+
+## Versioning
+
+The version is defined as `smar-version` constant in `smar.bb.clj`.
+**Bump the patch version on every change to `smar.bb.clj`.**
+Use semantic versioning: major.minor.patch.
 
 ## Architecture
 
