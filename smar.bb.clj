@@ -228,8 +228,6 @@
 ;; Backend detection & translation
 ;; ---------------------------------------------------------------------------
 
-(def backend-cache (atom {}))
-
 (defn probe-backend [base-url]
   (let [try-get (fn [path]
                   (try
@@ -241,14 +239,6 @@
       (try-get "/api/tags")     :ollama
       (try-get "/api/v1/model") :koboldcpp
       :else                     :llamacpp)))
-
-(defn get-backend [base-url]
-  (if-let [cached (get @backend-cache base-url)]
-    cached
-    (let [detected (probe-backend base-url)
-          backend  {:type detected :base-url base-url}]
-      (swap! backend-cache assoc base-url backend)
-      backend)))
 
 ;; -- translate-request ------------------------------------------------------
 
@@ -464,13 +454,24 @@
                                         :models       models})))
       (cli-error 1 "Missing required field: smar_target"))))
 
+(def valid-backends #{:ollama :koboldcpp :llamacpp})
+
 (defn resolve-backend-type [target smar-backend]
   (if smar-backend
-    (keyword smar-backend)
+    (let [bt (keyword smar-backend)]
+      (if (valid-backends bt)
+        bt
+        (cli-error 1 (str "Unknown smar_backend: " smar-backend
+                          ". Must be one of: ollama, koboldcpp, llamacpp"))))
     (try (probe-backend target)
          (catch Exception e
            (cli-error 2 (str "Backend unreachable: " target
                              " — " (.getMessage e)))))))
+
+(defn backend-call [f]
+  (try (f)
+       (catch Exception e
+         (cli-error 2 (str "Backend error: " (.getMessage e))))))
 
 (defn handle-complete []
   (let [input  (slurp *in*)
@@ -487,9 +488,8 @@
         (let [backend-type (resolve-backend-type target backend)
               openai-req   (-> (prepare-request body model-family)
                                (update :messages inject-tools-prompt tools))
-              response     (try (complete-with-tool-validation target backend-type openai-req tools 3)
-                                (catch Exception e
-                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))]
+              response     (backend-call
+                            #(complete-with-tool-validation target backend-type openai-req tools 3))]
           (println (json/generate-string response)))
 
         schema
@@ -500,26 +500,20 @@
             (= strat :grammar)
             (let [translated (-> (translate-request backend-type openai-req)
                                  (inject-grammar schema))
-                  raw-resp   (try (forward-request target translated)
-                                  (catch Exception e
-                                    (cli-error 2 (str "Backend error: " (.getMessage e)))))
+                  raw-resp   (backend-call #(forward-request target translated))
                   response   (translate-response backend-type raw-resp)]
               (println (json/generate-string response)))
 
             :else
-            (let [response (try (complete-with-validation
-                                  target backend-type openai-req schema 3)
-                                (catch Exception e
-                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))]
+            (let [response (backend-call
+                            #(complete-with-validation target backend-type openai-req schema 3))]
               (println (json/generate-string response)))))
 
         :else
         (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
               translated   (translate-request backend-type openai-req)
-              raw-resp     (try (forward-request target translated)
-                                (catch Exception e
-                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))
+              raw-resp     (backend-call #(forward-request target translated))
               response     (translate-response backend-type raw-resp)]
           (println (json/generate-string response))))
       (cli-error 1 "Missing required field: smar_target"))))
