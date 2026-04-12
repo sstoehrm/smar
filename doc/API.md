@@ -1,14 +1,38 @@
 # smar API Reference
 
-Base URL: `http://localhost:<server-port>`
+smar is a stateless CLI tool. Each invocation reads input, calls a backend, and writes output.
 
-All endpoints are POST with JSON body. Every request must include `smar_target`.
+## Commands
 
-## POST /smar/complete
+### preflight
 
-Unified completion endpoint. Mode determined by request body fields.
+Probe a backend and list available models.
 
-### Plain completion
+```bash
+bb smar.bb.clj preflight '{"smar_target":"http://localhost:11434"}'
+```
+
+**Output (stdout):**
+
+```json
+{
+  "backend_type": "ollama",
+  "target": "http://localhost:11434",
+  "models": [
+    {"id": "llama3:8b", "object": "model", "owned_by": "ollama"}
+  ]
+}
+```
+
+### complete
+
+Read a request from stdin, forward to backend, write response to stdout.
+
+```bash
+echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"Hello"}]}' | bb smar.bb.clj complete
+```
+
+#### Plain completion
 
 ```json
 {
@@ -22,7 +46,7 @@ Unified completion endpoint. Mode determined by request body fields.
 }
 ```
 
-### Structured JSON output
+#### Structured JSON output
 
 ```json
 {
@@ -42,7 +66,7 @@ Unified completion endpoint. Mode determined by request body fields.
 }
 ```
 
-### Tool calling
+#### Tool calling
 
 ```json
 {
@@ -75,6 +99,8 @@ Unified completion endpoint. Mode determined by request body fields.
 | `smar_model_family` | string | no | Model family preset (e.g. `llama3`, `mistral`, `qwen3`) |
 | `smar_schema` | object | no | JSON Schema for structured output enforcement |
 | `smar_tools` | array | no | Tool definitions for tool call enforcement |
+| `smar_backend` | string | no | Skip backend probe. One of: `ollama`, `koboldcpp`, `llamacpp` |
+| `smar_strategy` | string | no | Override structured output strategy: `grammar` or `validate` |
 | `model` | string | yes | Model name as reported by the backend |
 | `messages` | array | yes | Array of `{role, content}` message objects |
 | `temperature` | number | no | Sampling temperature |
@@ -83,7 +109,7 @@ Unified completion endpoint. Mode determined by request body fields.
 | `repeat_penalty` | number | no | Repetition penalty |
 | `max_tokens` | integer | no | Max tokens to generate |
 
-`smar_schema` and `smar_tools` are mutually exclusive. If both are present, the request returns 400.
+`smar_schema` and `smar_tools` are mutually exclusive. If both are present, smar exits with an error.
 
 All `smar_*` fields are stripped from the body before forwarding to the backend.
 
@@ -147,32 +173,9 @@ Each tool in `smar_tools` is an object:
 
 smar validates that the LLM response is a valid tool call (correct tool name, arguments matching the parameter schema). If invalid, it retries up to 3 times. smar does **not** execute tools — it returns the validated tool call to the client.
 
-## POST /smar/models
-
-List available models from a backend.
-
-**Request:**
-
-```json
-{
-  "smar_target": "http://localhost:11434"
-}
-```
-
-**Response:**
-
-```json
-{
-  "object": "list",
-  "data": [
-    {"id": "llama3:8b", "object": "model", "owned_by": "ollama"}
-  ]
-}
-```
-
 ## Structured Output Strategies
 
-smar picks a strategy automatically based on backend capability:
+smar picks a strategy automatically based on backend type:
 
 | Backend | Strategy | Mechanism |
 |---|---|---|
@@ -180,7 +183,7 @@ smar picks a strategy automatically based on backend capability:
 | KoboldCPP | grammar | GBNF grammar injected into request |
 | Ollama | validate | Generate freely, validate with malli, retry on failure (up to 3 times) |
 
-Override with the `x-smar-strategy` header (`grammar` or `validate`).
+Override with the `smar_strategy` field in the request body (`grammar` or `validate`).
 
 When validation fails after all retries, the response includes a `smar_validation` field:
 
@@ -194,10 +197,18 @@ When validation fails after all retries, the response includes a `smar_validatio
 }
 ```
 
-## Errors
+## Error Handling
 
-| Status | Cause |
+Errors are written as JSON to stderr:
+
+```json
+{"error": {"message": "missing smar_target", "type": "invalid_request_error"}}
+```
+
+### Exit codes
+
+| Code | Meaning |
 |---|---|
-| 400 | Missing `smar_target`, or both `smar_schema` and `smar_tools` present |
-| 404 | Unknown route |
-| 500 | Backend unreachable or internal error |
+| 0 | Success |
+| 1 | User/request error (missing fields, invalid input) |
+| 2 | Backend unreachable |

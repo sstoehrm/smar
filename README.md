@@ -2,7 +2,7 @@
 
 > **Experimental** — early development, APIs and behavior may change without notice, not recommended for production use.
 
-OpenAI-compatible proxy for local LLM backends. Single Babashka script, no config files.
+OpenAI-compatible CLI proxy for local LLM backends. Single Babashka script, no config files.
 
 Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests/responses transparently. Target backend is specified per request via `smar_target` in the request body.
 
@@ -13,63 +13,58 @@ Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests
 ## Usage
 
 ```
-bb smar.bb.clj <server-port>
-bb smar.bb.clj --self-test
+bb smar.bb.clj preflight '<json>'   # probe backend, list models
+bb smar.bb.clj complete             # read request from stdin, write response to stdout
+bb smar.bb.clj --self-test          # run inline tests
+bb smar.bb.clj --version            # print version
 ```
 
-| Parameter | Description |
+| Command | Description |
 |---|---|
-| `server-port` | Port smar listens on |
+| `preflight '<json>'` | Probe backend and list models. JSON must contain `smar_target`. |
+| `complete` | Read completion request from stdin, write response to stdout. |
 | `--self-test` | Run inline tests and exit |
+| `--version` | Print version and exit |
 
 ## Example
 
+**Preflight (probe backend and list models):**
+
 ```bash
-bb smar.bb.clj 8080
+bb smar.bb.clj preflight '{"smar_target":"http://localhost:11434"}'
 ```
 
 **Plain completion:**
 
 ```bash
-curl -X POST http://localhost:8080/smar/complete \
-  -H "Content-Type: application/json" \
-  -d '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"hello"}]}'
+echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"hello"}]}' \
+  | bb smar.bb.clj complete
 ```
 
 **Structured JSON output:**
 
 ```bash
-curl -X POST http://localhost:8080/smar/complete \
-  -H "Content-Type: application/json" \
-  -d '{"smar_target":"http://localhost:11434","smar_schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},"model":"llama3","messages":[{"role":"user","content":"give me a name"}]}'
+echo '{"smar_target":"http://localhost:11434","smar_schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},"model":"llama3","messages":[{"role":"user","content":"give me a name"}}' \
+  | bb smar.bb.clj complete
 ```
 
 **Tool calling:**
 
 ```bash
-curl -X POST http://localhost:8080/smar/complete \
-  -H "Content-Type: application/json" \
-  -d '{"smar_target":"http://localhost:11434","smar_tools":[{"name":"get_weather","description":"Get weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"model":"llama3","messages":[{"role":"user","content":"What is the weather in Berlin?"}]}'
+echo '{"smar_target":"http://localhost:11434","smar_tools":[{"name":"get_weather","description":"Get weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"model":"llama3","messages":[{"role":"user","content":"What is the weather in Berlin?"}]}' \
+  | bb smar.bb.clj complete
 ```
 
-**List models:**
+**Skip backend probe (if you already know the backend type):**
 
 ```bash
-curl -X POST http://localhost:8080/smar/models \
-  -H "Content-Type: application/json" \
-  -d '{"smar_target":"http://localhost:11434"}'
+echo '{"smar_target":"http://localhost:11434","smar_backend":"ollama","model":"llama3","messages":[{"role":"user","content":"hello"}]}' \
+  | bb smar.bb.clj complete
 ```
-
-## Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| POST | `/smar/complete` | Completion (plain, JSON schema, or tool call) |
-| POST | `/smar/models` | List models from a backend |
 
 ## Modes
 
-The `/smar/complete` endpoint mode is determined by which fields are present:
+The `complete` command mode is determined by which fields are present in the request:
 
 | Field | Mode | Description |
 |---|---|---|
@@ -89,15 +84,21 @@ Use `smar_model_family` to apply recommended defaults (temperature, top_p, top_k
 
 Available families: `llama3`, `mistral`, `gemma2`, `phi4`, `qwen25`, `qwen3`, `qwen35`, `deepseek`, `command-r`, `codellama`, `default`. Presets are defined as EDN files in the `models/` directory.
 
+## Error handling
+
+- Errors are JSON on stderr: `{"error":{"message":"...","type":"invalid_request_error"}}`
+- Exit 0: success
+- Exit 1: user/request error
+- Exit 2: backend unreachable
+
 ## Limitations
 
 - Grammar strategy (GBNF) trusts the backend to enforce structure — no post-validation
 - Streaming support is limited to Ollama passthrough
 - No authentication or rate limiting
-- Error handling for unreachable backends is minimal
 - Tool calling: smar enforces format only, does not execute tools
 
 ## Documentation
 
-- [API Reference](doc/API.md) — endpoints, request/response formats, structured output details
+- [API Reference](doc/API.md) — CLI commands, request/response formats, structured output details
 - [Supported Models](doc/MODELS.md) — tested models and implemented chat templates
