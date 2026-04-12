@@ -1,7 +1,7 @@
 #!/usr/bin/env bb
 
-;; smar — small agent harness
-;; OpenAI-compatible proxy for local LLM backends (ollama, koboldcpp, llama.cpp)
+;; smar -- small agent harness
+;; OpenAI-compatible CLI proxy for local LLM backends (ollama, koboldcpp, llama.cpp)
 
 ;; ---------------------------------------------------------------------------
 ;; Deps
@@ -10,8 +10,7 @@
 (require '[babashka.deps :as deps])
 (deps/add-deps '{:deps {metosin/malli {:mvn/version "0.16.4"}}})
 
-(require '[org.httpkit.server :as http]
-         '[org.httpkit.client :as client]
+(require '[org.httpkit.client :as client]
          '[cheshire.core :as json]
          '[clojure.string :as str]
          '[clojure.edn :as edn]
@@ -19,117 +18,11 @@
          '[malli.core :as m]
          '[malli.error :as me])
 
-(import '[org.jline.terminal TerminalBuilder]
-        '[org.jline.utils AttributedStringBuilder AttributedStyle])
-
-;; ---------------------------------------------------------------------------
-;; TUI — terminal output via JLine3
-;; ---------------------------------------------------------------------------
-
-(def ^:dynamic *terminal* nil)
-
-(defn create-terminal []
-  (-> (TerminalBuilder/builder)
-      (.system true)
-      (.jansi true)
-      (.build)))
-
-(defn styled [text & styles]
-  (let [sb    (AttributedStringBuilder.)
-        style (reduce (fn [s kw]
-                        (case kw
-                          :bold    (.bold s)
-                          :green   (.foreground s AttributedStyle/GREEN)
-                          :red     (.foreground s AttributedStyle/RED)
-                          :yellow  (.foreground s AttributedStyle/YELLOW)
-                          :cyan    (.foreground s AttributedStyle/CYAN)
-                          :magenta (.foreground s AttributedStyle/MAGENTA)
-                          :white   (.foreground s AttributedStyle/WHITE)
-                          :dim     (.faint s)
-                          s))
-                      AttributedStyle/DEFAULT
-                      styles)]
-    (.style sb style)
-    (.append sb (str text))
-    (.style sb AttributedStyle/DEFAULT)
-    (if *terminal*
-      (.toAnsi sb *terminal*)
-      (str text))))
-
-(defn tui-print [& parts]
-  (let [line (apply str parts)]
-    (if *terminal*
-      (let [w (.writer *terminal*)]
-        (.println w line)
-        (.flush w))
-      (println line))))
-
-(defn tui-print-no-nl [& parts]
-  (let [line (apply str parts)]
-    (if *terminal*
-      (let [w (.writer *terminal*)]
-        (.print w line)
-        (.flush w))
-      (print line))))
-
-(defn clear-line []
-  (tui-print-no-nl "\r\033[2K"))
-
-;; ---------------------------------------------------------------------------
-;; TUI — request tracking for server mode
-;; ---------------------------------------------------------------------------
-
-(def request-stats (atom {:total 0 :active 0 :errors 0 :last-requests []}))
-
-(defn track-request-start [_method _uri]
-  (swap! request-stats (fn [s]
-                         (-> s
-                             (update :total inc)
-                             (update :active inc)))))
-
-(defn track-request-end [method uri status latency-ms]
-  (swap! request-stats (fn [s]
-                         (-> s
-                             (update :active dec)
-                             (cond-> (>= status 400) (update :errors inc))
-                             (update :last-requests
-                                     (fn [reqs]
-                                       (take 20 (cons {:method  method
-                                                       :uri     uri
-                                                       :status  status
-                                                       :latency latency-ms
-                                                       :time    (java.time.LocalTime/now)}
-                                                      reqs))))))))
-
-(defn format-status [status]
-  (cond
-    (< status 300) (styled (str status) :green)
-    (< status 400) (styled (str status) :yellow)
-    :else          (styled (str status) :red)))
-
-(defn format-method [method]
-  (styled (str/upper-case (name method)) :cyan :bold))
-
-(defn format-latency [ms]
-  (cond
-    (< ms 100)  (styled (format "%4dms" ms) :green)
-    (< ms 1000) (styled (format "%4dms" ms) :yellow)
-    :else        (styled (format "%4dms" ms) :red)))
-
-(defn log-request [method uri status latency-ms]
-  (tui-print (styled (str (java.time.LocalTime/now)) :dim)
-             " "
-             (format-method method)
-             " " uri
-             " " (format-status status)
-             " " (format-latency latency-ms)))
-
 ;; ---------------------------------------------------------------------------
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
 (def smar-version "0.1.0")
-(def worker-threads 4)
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -155,52 +48,6 @@
 (defn get-preset-template [model-family]
   (when-let [preset (get model-presets model-family)]
     (:template preset)))
-
-;; ---------------------------------------------------------------------------
-;; TUI — startup display
-;; ---------------------------------------------------------------------------
-
-(defn spinner-frames [] ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
-
-(defn with-spinner [message work-fn]
-  (let [frames  (spinner-frames)
-        running (atom true)
-        spin-thread (Thread.
-                     (fn []
-                       (loop [i 0]
-                         (when @running
-                           (clear-line)
-                           (tui-print-no-nl (styled (nth frames (mod i (count frames))) :cyan)
-                                            " " message)
-                           (Thread/sleep 80)
-                           (recur (inc i))))))]
-    (.start spin-thread)
-    (try
-      (let [r (work-fn)]
-        (reset! running false)
-        (.join spin-thread 200)
-        (clear-line)
-        r)
-      (catch Exception e
-        (reset! running false)
-        (.join spin-thread 200)
-        (clear-line)
-        (throw e)))))
-
-(defn print-banner [server-port]
-  (tui-print)
-  (tui-print (styled "smar" :cyan :bold) (styled " — small agent harness" :dim))
-  (tui-print)
-  (tui-print (styled "  server   " :dim) (styled (str "http://0.0.0.0:" server-port) :white :bold))
-  (tui-print (styled "  threads  " :dim) (styled (str worker-threads) :white))
-  (tui-print (styled "  backend  " :dim) (styled "per-request via smar_target" :dim))
-  (tui-print)
-  (tui-print (styled "  Endpoints:" :dim))
-  (tui-print (styled "    POST " :cyan) "/smar/complete")
-  (tui-print (styled "    POST " :cyan) "/smar/models")
-  (tui-print)
-  (tui-print (styled "  Ctrl-C to stop" :dim))
-  (tui-print))
 
 ;; ---------------------------------------------------------------------------
 ;; Chat templates
@@ -495,13 +342,12 @@
 ;; Structured output: strategy selection & retry
 ;; ---------------------------------------------------------------------------
 
-(defn choose-strategy [backend-type request-headers]
-  (let [header (get request-headers "x-smar-strategy")]
-    (cond
-      (= header "grammar")  :grammar
-      (= header "validate") :validate
-      (supports-grammar? backend-type) :grammar
-      :else :validate)))
+(defn choose-strategy [backend-type strategy-override]
+  (cond
+    (= strategy-override "grammar")  :grammar
+    (= strategy-override "validate") :validate
+    (supports-grammar? backend-type) :grammar
+    :else :validate))
 
 (defn inject-grammar [translated-req json-schema]
   (let [grammar (json-schema->gbnf json-schema)]
@@ -563,29 +409,22 @@
 ;; Request handling
 ;; ---------------------------------------------------------------------------
 
-(defn parse-body [req]
-  (when-let [body (:body req)]
-    (json/parse-string (slurp body) true)))
-
-(defn json-response [status body]
-  {:status  status
-   :headers {"content-type" "application/json"}
-   :body    (json/generate-string body)})
-
-(defn error-response [status message]
-  (json-response status {:error {:message message :type "invalid_request_error"}}))
-
 (defn extract-smar-fields [parsed-body]
   (let [target       (:smar_target parsed-body)
         schema       (:smar_schema parsed-body)
         tools        (:smar_tools parsed-body)
-        model-family (:smar_model_family parsed-body)]
+        model-family (:smar_model_family parsed-body)
+        backend      (:smar_backend parsed-body)
+        strategy     (:smar_strategy parsed-body)]
     (when target
       {:target       target
        :schema       schema
        :tools        tools
        :model-family model-family
-       :body         (dissoc parsed-body :smar_target :smar_schema :smar_tools :smar_model_family)})))
+       :backend      backend
+       :strategy     strategy
+       :body         (dissoc parsed-body :smar_target :smar_schema :smar_tools
+                             :smar_model_family :smar_backend :smar_strategy)})))
 
 (defn inject-tools-prompt [messages tools]
   (let [system-msg {:role "system" :content (build-tools-system-prompt tools)}]
@@ -598,92 +437,92 @@
       (assoc req :smar_template preset-template)
       req)))
 
-(defn handle-complete [req]
-  (let [parsed (parse-body req)]
-    (if-let [{:keys [target schema tools model-family body]} (extract-smar-fields parsed)]
+;; ---------------------------------------------------------------------------
+;; CLI — error output and dispatch
+;; ---------------------------------------------------------------------------
+
+(defn cli-error [exit-code message]
+  (binding [*out* *err*]
+    (println (json/generate-string {:error {:message message
+                                            :type "invalid_request_error"}})))
+  (System/exit exit-code))
+
+(defn handle-preflight [json-str]
+  (let [parsed (try (json/parse-string json-str true)
+                    (catch Exception e
+                      (cli-error 1 (str "Invalid JSON: " (.getMessage e)))))]
+    (if-let [target (:smar_target parsed)]
+      (let [backend-type (try (probe-backend target)
+                              (catch Exception e
+                                (cli-error 2 (str "Backend unreachable: " target
+                                                  " — " (.getMessage e)))))
+            models       (try (list-models-remote backend-type target)
+                              (catch Exception _
+                                []))]
+        (println (json/generate-string {:backend_type (name backend-type)
+                                        :target       target
+                                        :models       models})))
+      (cli-error 1 "Missing required field: smar_target"))))
+
+(defn resolve-backend-type [target smar-backend]
+  (if smar-backend
+    (keyword smar-backend)
+    (try (probe-backend target)
+         (catch Exception e
+           (cli-error 2 (str "Backend unreachable: " target
+                             " — " (.getMessage e)))))))
+
+(defn handle-complete []
+  (let [input  (slurp *in*)
+        parsed (try (json/parse-string input true)
+                    (catch Exception e
+                      (cli-error 1 (str "Invalid JSON on stdin: " (.getMessage e)))))]
+    (if-let [{:keys [target schema tools model-family backend strategy body]}
+             (extract-smar-fields parsed)]
       (cond
         (and schema tools)
-        (error-response 400 "smar_schema and smar_tools are mutually exclusive")
+        (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
 
         tools
-        (let [backend      (get-backend target)
-              backend-type (:type backend)
+        (let [backend-type (resolve-backend-type target backend)
               openai-req   (-> (prepare-request body model-family)
-                               (update :messages inject-tools-prompt tools))]
-          (complete-with-tool-validation target backend-type openai-req tools 3))
+                               (update :messages inject-tools-prompt tools))
+              response     (try (complete-with-tool-validation target backend-type openai-req tools 3)
+                                (catch Exception e
+                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))]
+          (println (json/generate-string response)))
 
         schema
-        (let [backend      (get-backend target)
-              backend-type (:type backend)
+        (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
-              headers      (into {} (map (fn [[k v]] [(str/lower-case (name k)) v])
-                                         (:headers req)))
-              strategy     (choose-strategy backend-type headers)]
+              strat        (choose-strategy backend-type strategy)]
           (cond
-            (= strategy :grammar)
+            (= strat :grammar)
             (let [translated (-> (translate-request backend-type openai-req)
                                  (inject-grammar schema))
-                  raw-resp   (forward-request target translated)
+                  raw-resp   (try (forward-request target translated)
+                                  (catch Exception e
+                                    (cli-error 2 (str "Backend error: " (.getMessage e)))))
                   response   (translate-response backend-type raw-resp)]
-              (json-response 200 response))
+              (println (json/generate-string response)))
 
             :else
-            (let [response (complete-with-validation
-                            target backend-type openai-req schema 3)]
-              (json-response 200 response))))
+            (let [response (try (complete-with-validation
+                                  target backend-type openai-req schema 3)
+                                (catch Exception e
+                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))]
+              (println (json/generate-string response)))))
 
         :else
-        (let [backend      (get-backend target)
-              backend-type (:type backend)
+        (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
               translated   (translate-request backend-type openai-req)
-              raw-resp     (forward-request target translated)
+              raw-resp     (try (forward-request target translated)
+                                (catch Exception e
+                                  (cli-error 2 (str "Backend error: " (.getMessage e)))))
               response     (translate-response backend-type raw-resp)]
-          (json-response 200 response)))
-      (error-response 400 "Missing required field: smar_target"))))
-
-(defn handle-models [req]
-  (let [parsed (parse-body req)]
-    (if-let [target (:smar_target parsed)]
-      (let [backend (get-backend target)
-            models  (list-models-remote (:type backend) target)]
-        (json-response 200 {:object "list" :data models}))
-      (error-response 400 "Missing required field: smar_target"))))
-
-(defn wrap-request-tracking [handler]
-  (fn [req]
-    (let [method (:request-method req)
-          uri    (:uri req)
-          start  (System/currentTimeMillis)]
-      (track-request-start method uri)
-      (try
-        (let [resp    (handler req)
-              latency (- (System/currentTimeMillis) start)
-              status  (:status resp)]
-          (track-request-end method uri status latency)
-          (log-request method uri status latency)
-          resp)
-        (catch Exception e
-          (let [latency (- (System/currentTimeMillis) start)]
-            (track-request-end method uri 500 latency)
-            (log-request method uri 500 latency)
-            (json-response 500 {:error {:message (.getMessage e)
-                                        :type "internal_error"}})))))))
-
-(defn router []
-  (fn [req]
-    (let [uri    (:uri req)
-          method (:request-method req)]
-      (cond
-        (and (= method :post) (= uri "/smar/complete"))
-        (handle-complete req)
-
-        (and (= method :post) (= uri "/smar/models"))
-        (handle-models req)
-
-        :else
-        (json-response 404 {:error {:message "Not found"
-                                    :type "invalid_request_error"}})))))
+          (println (json/generate-string response))))
+      (cli-error 1 "Missing required field: smar_target"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Self-test
@@ -697,12 +536,12 @@
               (swap! total inc)
               (if pred
                 (do (swap! pass inc)
-                    (tui-print "  " (styled "PASS" :green) " " label))
+                    (println (str "  PASS " label)))
                 (do (swap! fail inc)
-                    (tui-print "  " (styled "FAIL" :red :bold) " " label))))
+                    (println (str "  FAIL " label)))))
             (section [title]
-              (tui-print)
-              (tui-print (styled (str "── " title " ──") :cyan :bold)))]
+              (println)
+              (println (str "-- " title " --")))]
 
       (section "Chat templates")
       (let [result (apply-template :chatml [{:role "user" :content "hello"}])]
@@ -811,13 +650,13 @@
 
       (section "Strategy selection")
       (check "grammar when supported"
-             (= :grammar (choose-strategy :llamacpp {})))
+             (= :grammar (choose-strategy :llamacpp nil)))
       (check "validate when not supported"
-             (= :validate (choose-strategy :ollama {})))
-      (check "header override to validate"
-             (= :validate (choose-strategy :llamacpp {"x-smar-strategy" "validate"})))
-      (check "header override to grammar"
-             (= :grammar (choose-strategy :ollama {"x-smar-strategy" "grammar"})))
+             (= :validate (choose-strategy :ollama nil)))
+      (check "override to validate"
+             (= :validate (choose-strategy :llamacpp "validate")))
+      (check "override to grammar"
+             (= :grammar (choose-strategy :ollama "grammar")))
 
       (section "Model presets")
       (check "presets loaded" (pos? (count model-presets)))
@@ -844,50 +683,38 @@
                     :smar_schema {"type" "object"}
                     :smar_tools  [{"name" "t"}]
                     :smar_model_family "llama3"
+                    :smar_backend "ollama"
+                    :smar_strategy "grammar"
                     :model "test" :messages []}
             result (extract-smar-fields parsed)]
         (check "extracts target" (= "http://localhost:1234" (:target result)))
         (check "extracts schema" (= {"type" "object"} (:schema result)))
         (check "extracts tools" (= [{"name" "t"}] (:tools result)))
         (check "extracts model-family" (= "llama3" (:model-family result)))
+        (check "extracts backend" (= "ollama" (:backend result)))
+        (check "extracts strategy" (= "grammar" (:strategy result)))
         (check "strips smar fields from body"
                (and (not (contains? (:body result) :smar_target))
                     (not (contains? (:body result) :smar_schema))
                     (not (contains? (:body result) :smar_tools))
                     (not (contains? (:body result) :smar_model_family))
+                    (not (contains? (:body result) :smar_backend))
+                    (not (contains? (:body result) :smar_strategy))
                     (= "test" (:model (:body result))))))
 
-      (section "Routing")
-      (let [handler (router)]
-        (check "404 for unknown route"
-               (= 404 (:status (handler {:uri "/nonexistent" :request-method :get}))))
-        (check "400 when smar_target missing"
-               (= 400 (:status (handler {:uri "/smar/complete"
-                                          :request-method :post
-                                          :body (java.io.ByteArrayInputStream.
-                                                 (.getBytes "{\"model\":\"test\",\"messages\":[]}"))}))))
-        (check "400 when schema+tools both present"
-               (let [body (json/generate-string {:smar_target "http://localhost:1234"
-                                                  :smar_schema {"type" "object"}
-                                                  :smar_tools [{"name" "t"}]
-                                                  :model "test"
-                                                  :messages []})
-                     resp (handler {:uri "/smar/complete"
-                                    :request-method :post
-                                    :body (java.io.ByteArrayInputStream. (.getBytes body))})]
-                 (= 400 (:status resp))))
-        (check "400 when smar_target missing (models)"
-               (= 400 (:status (handler {:uri "/smar/models"
-                                          :request-method :post
-                                          :body (java.io.ByteArrayInputStream.
-                                                 (.getBytes "{}"))})))))
+      (section "CLI error formatting")
+      (let [err-json (json/generate-string {:error {:message "test error"
+                                                    :type "invalid_request_error"}})]
+        (check "error json format"
+               (= {:error {:message "test error" :type "invalid_request_error"}}
+                  (json/parse-string err-json true))))
 
-      (tui-print)
+      (println)
       (let [p @pass f @fail t @total]
         (if (zero? f)
-          (tui-print (styled (str p "/" t " passed") :green :bold))
-          (tui-print (styled (str p "/" t " passed, " f " failed") :red :bold))))
-      (tui-print)
+          (println (str p "/" t " passed"))
+          (println (str p "/" t " passed, " f " failed"))))
+      (println)
       (when (pos? @fail)
         (System/exit 1)))))
 
@@ -896,29 +723,33 @@
 ;; ---------------------------------------------------------------------------
 
 (defn -main [& args]
-  (binding [*terminal* (create-terminal)]
-    (try
-      (cond
-        (some #{"--version"} args)
-        (tui-print (str "smar " smar-version))
+  (let [cmd (first args)]
+    (cond
+      (= cmd "--version")
+      (println (str "smar " smar-version))
 
-        (some #{"--self-test"} args)
-        (run-self-test)
+      (= cmd "--self-test")
+      (run-self-test)
 
-        (= 1 (count args))
-        (let [server-port (Integer/parseInt (first args))]
-          (print-banner server-port)
-          (http/run-server (wrap-request-tracking (router))
-                           {:port server-port :thread worker-threads})
-          @(promise))
+      (= cmd "preflight")
+      (if-let [json-str (second args)]
+        (handle-preflight json-str)
+        (cli-error 1 "Usage: smar preflight '<json>'"))
 
-        :else
-        (do
-          (tui-print (styled "Usage:" :bold) " bb smar.bb.clj <server-port>")
-          (tui-print (styled "       " :bold) " bb smar.bb.clj --self-test")
-          (tui-print (styled "       " :bold) " bb smar.bb.clj --version")
-          (System/exit 1)))
-      (finally
-        (.close *terminal*)))))
+      (= cmd "complete")
+      (handle-complete)
+
+      :else
+      (do
+        (println "Usage: bb smar.bb.clj <command>")
+        (println)
+        (println "Commands:")
+        (println "  preflight '<json>'   Probe backend, list models")
+        (println "  complete             Read request from stdin, write response to stdout")
+        (println)
+        (println "Flags:")
+        (println "  --self-test          Run inline tests")
+        (println "  --version            Print version")
+        (System/exit 1)))))
 
 (apply -main *command-line-args*)
