@@ -22,7 +22,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.2.3")
+(def smar-version "0.2.4")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -198,36 +198,63 @@
 
 (defn extract-json
   "Extract a JSON object or array from model output that may contain
-   chain-of-thought reasoning. Handles patterns like:
+   chain-of-thought reasoning or markdown fences. Handles patterns like:
+     - Clean {...} / [...] (returned unchanged)
      - <channel|>{...}
      - CoT text followed by {...}
-     - Clean JSON (returned as-is)"
+     - ```json\\n{...}\\n```
+   Uses bracket matching to return the exact JSON span (no trailing garbage).
+   Falls back to the original string if no valid JSON is found."
   [s]
-  (let [s (str/trim s)]
-    (or
-     ;; Fast path: clean JSON
-     (when (or (str/starts-with? s "{") (str/starts-with? s "["))
-       (try (json/parse-string s) s (catch Exception _ nil)))
-     ;; <channel|>{...} pattern
-     (when-let [idx (str/index-of s "<channel|>")]
-       (let [after (str/trim (subs s (+ idx (count "<channel|>"))))]
-         (try (json/parse-string after) after (catch Exception _ nil))))
-     ;; Last JSON object in text: find last { and try to parse from there
-     (loop [search-from (str/last-index-of s "{")]
-       (when (and search-from (>= search-from 0))
-         (let [candidate (subs s search-from)]
-           (if (try (json/parse-string candidate) true (catch Exception _ false))
-             candidate
-             (recur (str/last-index-of s "{" (dec search-from)))))))
-     ;; Last JSON array in text
-     (loop [search-from (str/last-index-of s "[")]
-       (when (and search-from (>= search-from 0))
-         (let [candidate (subs s search-from)]
-           (if (try (json/parse-string candidate) true (catch Exception _ false))
-             candidate
-             (recur (str/last-index-of s "[" (dec search-from)))))))
-     ;; Nothing found — return original
-     s)))
+  (letfn [(find-end [s start]
+            ;; Return index just past the matching close bracket for the
+            ;; opener at `start`, or nil. Respects string literals/escapes.
+            (let [n     (count s)
+                  open  (.charAt s start)
+                  close (case open \{ \} \[ \])]
+              (loop [i (inc start), depth 1, in-str false, escape false]
+                (cond
+                  (>= i n) nil
+                  (and in-str escape) (recur (inc i) depth in-str false)
+                  in-str (let [c (.charAt s i)]
+                           (cond
+                             (= c \\) (recur (inc i) depth in-str true)
+                             (= c \") (recur (inc i) depth false false)
+                             :else    (recur (inc i) depth in-str false)))
+                  :else (let [c (.charAt s i)]
+                          (cond
+                            (= c \")   (recur (inc i) depth true false)
+                            (= c open) (recur (inc i) (inc depth) false false)
+                            (= c close) (if (= depth 1)
+                                          (inc i)
+                                          (recur (inc i) (dec depth) false false))
+                            :else (recur (inc i) depth false false)))))))
+          (extract-at [s start]
+            (when-let [end (find-end s start)]
+              (let [candidate (subs s start end)]
+                (try (json/parse-string candidate) candidate
+                     (catch Exception _ nil)))))
+          (walk-back [s open-char]
+            (loop [pos (str/last-index-of s open-char)]
+              (when (and pos (>= pos 0))
+                (or (extract-at s pos)
+                    (recur (str/last-index-of s open-char (dec pos)))))))]
+    (let [s (str/trim s)]
+      (or
+       (when (or (str/starts-with? s "{") (str/starts-with? s "["))
+         (extract-at s 0))
+       (when-let [idx (str/index-of s "<channel|>")]
+         (let [after-idx (+ idx (count "<channel|>"))
+               n         (count s)
+               json-idx  (loop [i after-idx]
+                           (if (and (< i n) (Character/isWhitespace (.charAt s i)))
+                             (recur (inc i))
+                             i))]
+           (when (< json-idx n)
+             (extract-at s json-idx))))
+       (walk-back s \{)
+       (walk-back s \[)
+       s))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tool call validation
@@ -694,6 +721,18 @@
                                    "* Formulate response\n"
                                    "<channel|>"
                                    "{\"content\":\"hello\",\"expression\":\"neutral\"}"))))
+      (check "strips trailing markdown code fence"
+             (= "{\"a\":1}"
+                (extract-json "Here you go:\n```json\n{\"a\":1}\n```")))
+      (check "strips trailing text after json"
+             (= "{\"a\":1}"
+                (extract-json "<channel|>{\"a\":1} please let me know if that works")))
+      (check "respects braces inside string literals"
+             (= "{\"msg\":\"has } brace\"}"
+                (extract-json "prefix {\"msg\":\"has } brace\"}")))
+      (check "extracts json array after CoT"
+             (= "[1,2,3]"
+                (extract-json "The list is:\n```\n[1,2,3]\n```")))
 
       (section "Schema validation")
       (let [schema {"type" "object"
