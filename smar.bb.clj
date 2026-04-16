@@ -22,7 +22,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.2.0")
+(def smar-version "0.2.2")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -101,9 +101,18 @@
 
 (defn json-schema->gbnf [schema]
   (letfn [(type->rule [s path]
-            (let [t (get s "type" (get s :type))]
-              (case t
-                "string"  "\"\\\"\" [^\"\\\\]* \"\\\"\" "
+            (let [t    (get s "type" (get s :type))
+                  enum (get s "enum" (get s :enum))]
+              (if enum
+                (str "(" (str/join " | "
+                           (map (fn [v]
+                                  (if (string? v)
+                                    (str "\"\\\"" v "\\\"\"")
+                                    (str "\"" v "\"")))
+                                enum))
+                     ")")
+                (case t
+                  "string"  "\"\\\"\" [^\"\\\\]* \"\\\"\" "
                 "number"  "[\"-\"]? [0-9]+ (\".\" [0-9]+)?"
                 "integer" "[\"-\"]? [0-9]+"
                 "boolean" "(\"true\" | \"false\")"
@@ -118,12 +127,12 @@
                             (str "\"{\" ws "
                                  (str/join " \",\" ws "
                                            (map (fn [k]
-                                                  (str "\"\\\"" k "\\\":\" ws "
-                                                       (type->rule (get props k) (conj path k))))
+                                                  (str "\"\\\"" (name k) "\\\":\" ws "
+                                                       (type->rule (get props k) (conj path (name k)))))
                                                 keys))
                                  " ws \"}\""))
-                ;; fallback
-                "[^\\x00]*")))]
+                  ;; fallback
+                  "[^\\x00]*"))))]
     (str "root ::= " (type->rule schema []) "\n"
          "ws ::= [ \\t\\n]*\n")))
 
@@ -161,6 +170,43 @@
          :errors (me/humanize (m/explain schema data))}))
     (catch Exception e
       {:valid false :errors (str "JSON parse error: " (.getMessage e))})))
+
+;; ---------------------------------------------------------------------------
+;; Content extraction — strip chain-of-thought from structured responses
+;; ---------------------------------------------------------------------------
+
+(defn extract-json
+  "Extract a JSON object or array from model output that may contain
+   chain-of-thought reasoning. Handles patterns like:
+     - <channel|>{...}
+     - CoT text followed by {...}
+     - Clean JSON (returned as-is)"
+  [s]
+  (let [s (str/trim s)]
+    (or
+     ;; Fast path: clean JSON
+     (when (or (str/starts-with? s "{") (str/starts-with? s "["))
+       (try (json/parse-string s) s (catch Exception _ nil)))
+     ;; <channel|>{...} pattern
+     (when-let [idx (str/index-of s "<channel|>")]
+       (let [after (str/trim (subs s (+ idx (count "<channel|>"))))]
+         (try (json/parse-string after) after (catch Exception _ nil))))
+     ;; Last JSON object in text: find last { and try to parse from there
+     (loop [search-from (str/last-index-of s "{")]
+       (when (and search-from (>= search-from 0))
+         (let [candidate (subs s search-from)]
+           (if (try (json/parse-string candidate) true (catch Exception _ false))
+             candidate
+             (recur (str/last-index-of s "{" (dec search-from)))))))
+     ;; Last JSON array in text
+     (loop [search-from (str/last-index-of s "[")]
+       (when (and search-from (>= search-from 0))
+         (let [candidate (subs s search-from)]
+           (if (try (json/parse-string candidate) true (catch Exception _ false))
+             candidate
+             (recur (str/last-index-of s "[" (dec search-from)))))))
+     ;; Nothing found — return original
+     s)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tool call validation
@@ -357,7 +403,9 @@
           translated   (translate-request backend-type current-req)
           raw-resp     (forward-request base-url translated)
           openai-resp  (translate-response backend-type raw-resp)
-          content      (get-in openai-resp [:choices 0 :message :content] "")
+          raw-content  (get-in openai-resp [:choices 0 :message :content] "")
+          content      (extract-json raw-content)
+          openai-resp  (assoc-in openai-resp [:choices 0 :message :content] content)
           validation   (validate-response json-schema content)]
       (if (:valid validation)
         openai-resp
@@ -379,7 +427,7 @@
           translated   (translate-request backend-type current-req)
           raw-resp     (forward-request base-url translated)
           openai-resp  (translate-response backend-type raw-resp)
-          content      (get-in openai-resp [:choices 0 :message :content] "")
+          content      (extract-json (get-in openai-resp [:choices 0 :message :content] ""))
           validation   (validate-tool-call tools content)]
       (if (:valid validation)
         (tool-call-response (:model req) (:tool-call validation))
@@ -501,7 +549,10 @@
             (let [translated (-> (translate-request backend-type openai-req)
                                  (inject-grammar schema))
                   raw-resp   (backend-call #(forward-request target translated))
-                  response   (translate-response backend-type raw-resp)]
+                  response   (translate-response backend-type raw-resp)
+                  content    (get-in response [:choices 0 :message :content] "")
+                  response   (assoc-in response [:choices 0 :message :content]
+                                       (extract-json content))]
               (println (json/generate-string response)))
 
             :else
@@ -562,6 +613,44 @@
         (check "gbnf has ws rule" (str/includes? gbnf "ws ::="))
         (check "gbnf references name field" (str/includes? gbnf "name"))
         (check "gbnf references age field" (str/includes? gbnf "age")))
+      ;; keyword keys should produce clean JSON keys (no leading colons)
+      (let [gbnf (json-schema->gbnf {:type "object"
+                                     :properties {:content {:type "string"}
+                                                  :mood    {:type "string"}}})]
+        (check "keyword keys have no colons"
+               (and (str/includes? gbnf "content")
+                    (not (str/includes? gbnf ":content"))
+                    (str/includes? gbnf "mood")
+                    (not (str/includes? gbnf ":mood")))))
+      ;; enum values should be constrained
+      (let [gbnf (json-schema->gbnf {"type" "object"
+                                     "properties" {"color" {"type" "string"
+                                                            "enum" ["red" "blue" "green"]}}})]
+        (check "enum generates alternation"
+               (and (str/includes? gbnf "red")
+                    (str/includes? gbnf "blue")
+                    (str/includes? gbnf "green")
+                    (str/includes? gbnf "|"))))
+
+      (section "Content extraction")
+      (check "clean json passes through"
+             (= "{\"a\":1}" (extract-json "{\"a\":1}")))
+      (check "extracts json after channel tag"
+             (= "{\"content\":\"hi\"}"
+                (extract-json "* reasoning\n<channel|>{\"content\":\"hi\"}")))
+      (check "extracts json after CoT"
+             (= "{\"answer\":42}"
+                (extract-json "Let me think about this...\n{\"answer\":42}")))
+      (check "handles whitespace around json"
+             (= "{\"x\":1}" (extract-json "  {\"x\":1}  ")))
+      (check "returns original when no json found"
+             (= "just plain text" (extract-json "just plain text")))
+      (check "extracts json after markdown CoT"
+             (= "{\"content\":\"hello\",\"expression\":\"neutral\"}"
+                (extract-json (str "* Analyze the request\n"
+                                   "* Formulate response\n"
+                                   "<channel|>"
+                                   "{\"content\":\"hello\",\"expression\":\"neutral\"}"))))
 
       (section "Schema validation")
       (let [schema {"type" "object"
