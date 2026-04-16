@@ -1,0 +1,8 @@
+{:family      "gemma4"
+ :template    :gemma4
+ :defaults    {:temperature    1.0
+               :top_p          0.95
+               :top_k          64
+               :repeat_penalty 1.0
+               :max_tokens     2048}
+ :description "Google Gemma 4 family (E2B, E4B, 26B A4B, 31B). Same template and params across variants. To enable thinking mode, include the <|think|> token in the system prompt."}

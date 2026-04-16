@@ -22,7 +22,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.2.2")
+(def smar-version "0.2.3")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -73,7 +73,25 @@
     :eos    "</s>"
     :start  (fn [role] (if (= role "user") "[INST] " ""))
     :end    (fn [role] (if (= role "user") " [/INST]" "</s>"))
-    :suffix ""}})
+    :suffix ""}
+
+   :gemma2
+   {:bos    "<bos>"
+    :eos    ""
+    :start  (fn [role] (str "<start_of_turn>"
+                            (case role "assistant" "model" role)
+                            "\n"))
+    :end    "<end_of_turn>\n"
+    :suffix "<start_of_turn>model\n"}
+
+   :gemma4
+   {:bos    ""
+    :eos    ""
+    :start  (fn [role] (str "<|turn>"
+                            (case role "assistant" "model" role)
+                            "\n"))
+    :end    "<turn|>\n"
+    :suffix "<|turn>model\n"}})
 
 (defn apply-template [template-key messages]
   (let [tmpl (get templates template-key (:chatml templates))]
@@ -93,6 +111,9 @@
       (str/includes? lower "llama-3")  :llama3
       (str/includes? lower "llama3")   :llama3
       (str/includes? lower "mistral")  :mistral
+      (or (str/includes? lower "gemma-4")
+          (str/includes? lower "gemma4"))  :gemma4
+      (str/includes? lower "gemma")    :gemma2
       :else                            :chatml)))
 
 ;; ---------------------------------------------------------------------------
@@ -598,10 +619,32 @@
         (check "llama3 template"
                (and (str/includes? result "<|begin_of_text|>")
                     (str/includes? result "<|start_header_id|>user"))))
+      (let [result (apply-template :gemma2 [{:role "user" :content "hi"}
+                                             {:role "assistant" :content "hello"}])]
+        (check "gemma2 template uses start_of_turn"
+               (and (str/includes? result "<bos>")
+                    (str/includes? result "<start_of_turn>user")
+                    (str/includes? result "<start_of_turn>model\nhello")
+                    (str/includes? result "<end_of_turn>")
+                    (str/ends-with? result "<start_of_turn>model\n"))))
+      (let [result (apply-template :gemma4 [{:role "system" :content "sys"}
+                                             {:role "user" :content "hi"}
+                                             {:role "assistant" :content "hello"}])]
+        (check "gemma4 template uses turn delimiters"
+               (and (str/includes? result "<|turn>system\nsys<turn|>")
+                    (str/includes? result "<|turn>user\nhi<turn|>")
+                    (str/includes? result "<|turn>model\nhello<turn|>")
+                    (str/ends-with? result "<|turn>model\n"))))
       (check "detect llama3 model"
              (= :llama3 (detect-template-from-model "meta-llama3-8b")))
       (check "detect mistral model"
              (= :mistral (detect-template-from-model "Mistral-7B")))
+      (check "detect gemma-4 model"
+             (= :gemma4 (detect-template-from-model "gemma-4-26B-A4B-it")))
+      (check "detect gemma4 model (no dash)"
+             (= :gemma4 (detect-template-from-model "gemma4:e4b")))
+      (check "detect gemma-2 model"
+             (= :gemma2 (detect-template-from-model "gemma-2-9b-it")))
       (check "detect fallback to chatml"
              (= :chatml (detect-template-from-model "some-random-model")))
 
