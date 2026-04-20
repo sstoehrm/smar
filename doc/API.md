@@ -9,7 +9,7 @@ smar is a stateless CLI tool. Each invocation reads input, calls a backend, and 
 Probe a backend and list available models.
 
 ```bash
-bb smar.bb.clj preflight '{"smar_target":"http://localhost:11434"}'
+bb smar.clj preflight '{"smar_target":"http://localhost:11434"}'
 ```
 
 **Output (stdout):**
@@ -29,7 +29,7 @@ bb smar.bb.clj preflight '{"smar_target":"http://localhost:11434"}'
 Read a request from stdin, forward to backend, write response to stdout.
 
 ```bash
-echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"Hello"}]}' | bb smar.bb.clj complete
+echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"Hello"}]}' | bb smar.clj complete
 ```
 
 #### Plain completion

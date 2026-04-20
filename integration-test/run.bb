@@ -20,7 +20,7 @@
 
 (def script-file (or (System/getProperty "babashka.file") *file*))
 (def repo-root (.. (io/file script-file) getAbsoluteFile getParentFile getParentFile getAbsolutePath))
-(def smar-path (str repo-root "/smar.bb.clj"))
+(def smar-path (str repo-root "/smar.clj"))
 
 (def pass (atom 0))
 (def fail (atom 0))

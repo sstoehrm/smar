@@ -13,10 +13,10 @@ Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests
 ## Usage
 
 ```
-bb smar.bb.clj preflight '<json>'   # probe backend, list models
-bb smar.bb.clj complete             # read request from stdin, write response to stdout
-bb smar.bb.clj --self-test          # run inline tests
-bb smar.bb.clj --version            # print version
+bb smar.clj preflight '<json>'   # probe backend, list models
+bb smar.clj complete             # read request from stdin, write response to stdout
+bb smar.clj --self-test          # run inline tests
+bb smar.clj --version            # print version
 ```
 
 | Command | Description |
@@ -31,35 +31,35 @@ bb smar.bb.clj --version            # print version
 **Preflight (probe backend and list models):**
 
 ```bash
-bb smar.bb.clj preflight '{"smar_target":"http://localhost:11434"}'
+bb smar.clj preflight '{"smar_target":"http://localhost:11434"}'
 ```
 
 **Plain completion:**
 
 ```bash
 echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"role":"user","content":"hello"}]}' \
-  | bb smar.bb.clj complete
+  | bb smar.clj complete
 ```
 
 **Structured JSON output:**
 
 ```bash
 echo '{"smar_target":"http://localhost:11434","smar_schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},"model":"llama3","messages":[{"role":"user","content":"give me a name"}}' \
-  | bb smar.bb.clj complete
+  | bb smar.clj complete
 ```
 
 **Tool calling:**
 
 ```bash
 echo '{"smar_target":"http://localhost:11434","smar_tools":[{"name":"get_weather","description":"Get weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"model":"llama3","messages":[{"role":"user","content":"What is the weather in Berlin?"}]}' \
-  | bb smar.bb.clj complete
+  | bb smar.clj complete
 ```
 
 **Skip backend probe (if you already know the backend type):**
 
 ```bash
 echo '{"smar_target":"http://localhost:11434","smar_backend":"ollama","model":"llama3","messages":[{"role":"user","content":"hello"}]}' \
-  | bb smar.bb.clj complete
+  | bb smar.clj complete
 ```
 
 ## Modes
@@ -82,7 +82,7 @@ Use `smar_model_family` to apply recommended defaults (temperature, top_p, top_k
 {"smar_target": "...", "smar_model_family": "llama3", "model": "llama3:8b", "messages": [...]}
 ```
 
-Available families: `llama3`, `mistral`, `gemma2`, `phi4`, `qwen25`, `qwen3`, `qwen35`, `deepseek`, `command-r`, `codellama`, `default`. Presets are defined as EDN files in the `models/` directory.
+Available families: `llama3`, `mistral`, `gemma2`, `phi4`, `qwen25`, `qwen3`, `qwen35`, `deepseek`, `command-r`, `codellama`, `default`. Presets are EDN files loaded from `~/.local/smar/models/` by default (override with `SMAR_MODELS_DIR`). Install with `cp -r models ~/.local/smar/models`; the `models/` directory in this repo is the source.
 
 ## Error handling
 

@@ -1,26 +1,31 @@
 # smar — small agent harness
 
-Single-file Babashka CLI tool (`smar.bb.clj`) that proxies between clients and local LLM backends.
-OpenAI-compatible stateless CLI with structured output enforcement.
+Single-file Babashka script + library (`smar.clj`, ns `smar`) that proxies between clients and
+local LLM backends. OpenAI-compatible, stateless CLI with structured output enforcement.
+The same file is both runnable (`bb smar.clj …`) and requirable (`(require '[smar :as smar])`)
+via a guarded `-main` dispatch at the end.
 
 ## Quick reference
 
 ```bash
-bb smar.bb.clj preflight '<json>'   # probe backend, list models
-bb smar.bb.clj complete             # read request from stdin, write response to stdout
-bb smar.bb.clj --self-test          # run inline tests
-bb smar.bb.clj --version            # print version
+bb smar.clj preflight '<json>'   # probe backend, list models
+bb smar.clj complete             # read request from stdin, write response to stdout
+bb smar.clj --self-test          # run inline tests
+bb smar.clj --version            # print version
 ```
 
 ## Versioning
 
-The version is defined as `smar-version` constant in `smar.bb.clj`.
-**Bump the patch version on every change to `smar.bb.clj`.**
+The version is defined as `smar-version` constant in `smar.clj`.
+**Bump the patch version on every change to `smar.clj`.**
 Use semantic versioning: major.minor.patch.
 
 ## Architecture
 
-- Single file: `smar.bb.clj` — deps loaded inline via `babashka.deps/add-deps`
+- Single file: `smar.clj` (ns `smar`) — deps loaded inline via `babashka.deps/add-deps`
+- `bb.edn` at repo root exposes `.` on the classpath so consumers can `(require '[smar :as smar])`
+- CLI dispatch at EOF is guarded by `(= *file* (System/getProperty "babashka.file"))` so it only
+  fires when executed directly, not when required as a library
 - Requires Babashka >= 1.12.215
 - Deps: malli (inline), httpkit client + cheshire (bundled in bb)
 - Stateless CLI: dispatches on first argument (`preflight`, `complete`, `--self-test`, `--version`)
@@ -57,7 +62,9 @@ Mode determined by which `smar_*` fields are present:
 
 ## Model presets
 
-EDN files in `models/` directory, loaded at startup into `model-presets` map.
+EDN files in `~/.local/smar/models/` (override with `SMAR_MODELS_DIR`), loaded at
+startup into `model-presets` map. Install once: `cp -r models ~/.local/smar/models`.
+For repo-local dev (self-test etc.): `SMAR_MODELS_DIR=./models bb smar.clj ...`.
 Each file: `{:family "name" :template :key :defaults {:temperature ...} :description "..."}`.
 `apply-model-preset` merges defaults under explicit request fields (request wins).
 `get-preset-template` returns the template key for koboldcpp translation.

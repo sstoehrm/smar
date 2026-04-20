@@ -10,26 +10,32 @@
 (require '[babashka.deps :as deps])
 (deps/add-deps '{:deps {metosin/malli {:mvn/version "0.16.4"}}})
 
-(require '[org.httpkit.client :as client]
-         '[cheshire.core :as json]
-         '[clojure.string :as str]
-         '[clojure.edn :as edn]
-         '[clojure.java.io :as io]
-         '[malli.core :as m]
-         '[malli.error :as me])
+(ns smar
+  (:require [org.httpkit.client :as client]
+            [cheshire.core :as json]
+            [clojure.string :as str]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [malli.core :as m]
+            [malli.error :as me]))
 
 ;; ---------------------------------------------------------------------------
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.2.4")
+(def smar-version "0.3.0")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
 ;; ---------------------------------------------------------------------------
 
+(defn models-dir []
+  (io/file
+    (or (System/getenv "SMAR_MODELS_DIR")
+        (str (System/getProperty "user.home") "/.local/smar/models"))))
+
 (defn load-model-presets []
-  (let [dir (io/file "models")]
+  (let [dir (models-dir)]
     (if (.isDirectory dir)
       (into {}
             (for [f (.listFiles dir)
@@ -906,7 +912,7 @@
 
       :else
       (do
-        (println "Usage: bb smar.bb.clj <command>")
+        (println "Usage: bb smar.clj <command>")
         (println)
         (println "Commands:")
         (println "  preflight '<json>'   Probe backend, list models")
@@ -917,4 +923,6 @@
         (println "  --version            Print version")
         (System/exit 1)))))
 
-(apply -main *command-line-args*)
+;; Fires only when executed directly (bb smar.clj …), not when required as a lib.
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

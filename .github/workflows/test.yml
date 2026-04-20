@@ -16,4 +16,4 @@ jobs:
         with:
           bb: latest
 
-      - run: bb smar.bb.clj --self-test
+      - run: SMAR_MODELS_DIR=./models bb smar.clj --self-test
