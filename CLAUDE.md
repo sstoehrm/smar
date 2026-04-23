@@ -65,9 +65,8 @@ Mode determined by which `smar_*` fields are present:
 EDN files in `~/.local/smar/models/` (override with `SMAR_MODELS_DIR`), loaded at
 startup into `model-presets` map. Install once: `cp -r models ~/.local/smar/models`.
 For repo-local dev (self-test etc.): `SMAR_MODELS_DIR=./models bb smar.clj ...`.
-Each file: `{:family "name" :template :key :defaults {:temperature ...} :description "..."}`.
+Each file: `{:family "name" :defaults {:temperature ...} :description "..."}`.
 `apply-model-preset` merges defaults under explicit request fields (request wins).
-`get-preset-template` returns the template key for koboldcpp translation.
 
 ## Backend detection
 
