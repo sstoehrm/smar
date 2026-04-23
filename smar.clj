@@ -51,76 +51,6 @@
     (merge (:defaults preset) openai-req)
     openai-req))
 
-(defn get-preset-template [model-family]
-  (when-let [preset (get model-presets model-family)]
-    (:template preset)))
-
-;; ---------------------------------------------------------------------------
-;; Chat templates
-;; ---------------------------------------------------------------------------
-
-(def templates
-  {:chatml
-   {:bos    ""
-    :eos    ""
-    :start  (fn [role] (str "<|im_start|>" role "\n"))
-    :end    "<|im_end|>\n"
-    :suffix "<|im_start|>assistant\n"}
-
-   :llama3
-   {:bos    "<|begin_of_text|>"
-    :eos    "<|end_of_text|>"
-    :start  (fn [role] (str "<|start_header_id|>" role "<|end_header_id|>\n\n"))
-    :end    "<|eot_id|>\n"
-    :suffix "<|start_header_id|>assistant<|end_header_id|>\n\n"}
-
-   :mistral
-   {:bos    "<s>"
-    :eos    "</s>"
-    :start  (fn [role] (if (= role "user") "[INST] " ""))
-    :end    (fn [role] (if (= role "user") " [/INST]" "</s>"))
-    :suffix ""}
-
-   :gemma2
-   {:bos    "<bos>"
-    :eos    ""
-    :start  (fn [role] (str "<start_of_turn>"
-                            (case role "assistant" "model" role)
-                            "\n"))
-    :end    "<end_of_turn>\n"
-    :suffix "<start_of_turn>model\n"}
-
-   :gemma4
-   {:bos    ""
-    :eos    ""
-    :start  (fn [role] (str "<|turn>"
-                            (case role "assistant" "model" role)
-                            "\n"))
-    :end    "<turn|>\n"
-    :suffix "<|turn>model\n"}})
-
-(defn apply-template [template-key messages]
-  (let [tmpl (get templates template-key (:chatml templates))]
-    (str (:bos tmpl)
-         (apply str
-                (for [{:keys [role content]} messages]
-                  (let [start-fn (:start tmpl)
-                        end-val  (:end tmpl)
-                        start    (if (fn? start-fn) (start-fn role) start-fn)
-                        end      (if (fn? end-val) (end-val role) end-val)]
-                    (str start content end))))
-         (:suffix tmpl))))
-
-(defn detect-template-from-model [model-name]
-  (let [lower (str/lower-case (or model-name ""))]
-    (cond
-      (str/includes? lower "llama-3")  :llama3
-      (str/includes? lower "llama3")   :llama3
-      (str/includes? lower "mistral")  :mistral
-      (or (str/includes? lower "gemma-4")
-          (str/includes? lower "gemma4"))  :gemma4
-      (str/includes? lower "gemma")    :gemma2
-      :else                            :chatml)))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema validation (malli)
@@ -466,11 +396,7 @@
     (vec (cons system-msg messages))))
 
 (defn prepare-request [body model-family]
-  (let [preset-template (get-preset-template model-family)
-        req             (apply-model-preset body model-family)]
-    (if preset-template
-      (assoc req :smar_template preset-template)
-      req)))
+  (apply-model-preset body model-family))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI — error output and dispatch
@@ -583,45 +509,6 @@
             (section [title]
               (println)
               (println (str "-- " title " --")))]
-
-      (section "Chat templates")
-      (let [result (apply-template :chatml [{:role "user" :content "hello"}])]
-        (check "chatml wraps user message"
-               (and (str/includes? result "<|im_start|>user")
-                    (str/includes? result "hello")
-                    (str/includes? result "<|im_end|>"))))
-      (let [result (apply-template :llama3 [{:role "user" :content "hi"}])]
-        (check "llama3 template"
-               (and (str/includes? result "<|begin_of_text|>")
-                    (str/includes? result "<|start_header_id|>user"))))
-      (let [result (apply-template :gemma2 [{:role "user" :content "hi"}
-                                             {:role "assistant" :content "hello"}])]
-        (check "gemma2 template uses start_of_turn"
-               (and (str/includes? result "<bos>")
-                    (str/includes? result "<start_of_turn>user")
-                    (str/includes? result "<start_of_turn>model\nhello")
-                    (str/includes? result "<end_of_turn>")
-                    (str/ends-with? result "<start_of_turn>model\n"))))
-      (let [result (apply-template :gemma4 [{:role "system" :content "sys"}
-                                             {:role "user" :content "hi"}
-                                             {:role "assistant" :content "hello"}])]
-        (check "gemma4 template uses turn delimiters"
-               (and (str/includes? result "<|turn>system\nsys<turn|>")
-                    (str/includes? result "<|turn>user\nhi<turn|>")
-                    (str/includes? result "<|turn>model\nhello<turn|>")
-                    (str/ends-with? result "<|turn>model\n"))))
-      (check "detect llama3 model"
-             (= :llama3 (detect-template-from-model "meta-llama3-8b")))
-      (check "detect mistral model"
-             (= :mistral (detect-template-from-model "Mistral-7B")))
-      (check "detect gemma-4 model"
-             (= :gemma4 (detect-template-from-model "gemma-4-26B-A4B-it")))
-      (check "detect gemma4 model (no dash)"
-             (= :gemma4 (detect-template-from-model "gemma4:e4b")))
-      (check "detect gemma-2 model"
-             (= :gemma2 (detect-template-from-model "gemma-2-9b-it")))
-      (check "detect fallback to chatml"
-             (= :chatml (detect-template-from-model "some-random-model")))
 
       (section "Content extraction")
       (check "clean json passes through"
@@ -811,8 +698,6 @@
       (check "llama3 preset exists" (contains? model-presets "llama3"))
       (check "llama3 preset has temperature"
              (= 0.6 (get-in model-presets ["llama3" :defaults :temperature])))
-      (check "llama3 preset has template"
-             (= :llama3 (get-in model-presets ["llama3" :template])))
       (let [req {:model "test" :messages [] :temperature 0.9}
             result (apply-model-preset req "llama3")]
         (check "preset applies defaults" (= 0.9 (get-in result [:top_p])))
@@ -823,8 +708,6 @@
       (let [req {:model "test"}
             result (apply-model-preset req "nonexistent")]
         (check "unknown family returns unchanged" (= req result)))
-      (check "preset template for llama3" (= :llama3 (get-preset-template "llama3")))
-      (check "preset template for unknown is nil" (nil? (get-preset-template "nonexistent")))
 
       (section "Smar fields extraction")
       (let [parsed {:smar_target "http://localhost:1234"
