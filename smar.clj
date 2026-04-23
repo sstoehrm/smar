@@ -266,6 +266,22 @@
 ;; Tool call validation
 ;; ---------------------------------------------------------------------------
 
+(defn tools->schema
+  "Synthesise a JSON Schema (oneOf) that matches any valid tool call over `tools`.
+   Used as the decode-time constraint on the `smar_tools` path."
+  [tools]
+  {:oneOf
+   (mapv (fn [tool]
+           (let [name   (get tool "name" (get tool :name))
+                 params (or (get tool "parameters" (get tool :parameters))
+                            {:type "object"})]
+             {:type "object"
+              :additionalProperties false
+              :required ["name" "arguments"]
+              :properties {"name"      {:const name}
+                           "arguments" params}}))
+         tools)})
+
 (defn build-tools-system-prompt [tools]
   (str "You have access to the following tools:\n\n"
        (str/join "\n\n"
@@ -784,6 +800,43 @@
         (check "valid second tool"
                (:valid (validate-tool-call tools
                          "{\"name\":\"search\",\"arguments\":{\"query\":\"weather Berlin\"}}"))))
+
+      (section "Tools schema synthesis")
+      (let [tools  [{"name" "get_weather"
+                     "description" "Get weather"
+                     "parameters" {"type" "object"
+                                   "properties" {"city" {"type" "string"}}
+                                   "required" ["city"]}}
+                    {"name" "search"
+                     "description" "Search"
+                     "parameters" {"type" "object"
+                                   "properties" {"query" {"type" "string"}}
+                                   "required" ["query"]}}]
+            schema (tools->schema tools)]
+        (check "schema is oneOf"
+               (and (map? schema) (vector? (:oneOf schema))))
+        (check "one branch per tool"
+               (= 2 (count (:oneOf schema))))
+        (check "first branch pins name to const"
+               (= "get_weather" (get-in schema [:oneOf 0 :properties "name" :const])))
+        (check "first branch attaches parameters as arguments schema"
+               (= {"type" "object"
+                   "properties" {"city" {"type" "string"}}
+                   "required" ["city"]}
+                  (get-in schema [:oneOf 0 :properties "arguments"])))
+        (check "branches forbid extra keys"
+               (false? (get-in schema [:oneOf 0 :additionalProperties])))
+        (check "branches require name and arguments"
+               (= ["name" "arguments"] (get-in schema [:oneOf 0 :required]))))
+      (let [tools  [{"name" "noop" "description" "." "parameters" nil}]
+            schema (tools->schema tools)]
+        (check "missing parameters defaults to object schema"
+               (= {:type "object"}
+                  (get-in schema [:oneOf 0 :properties "arguments"]))))
+      (let [tools  [{:name "kw" :description "." :parameters {:type "object"}}]
+            schema (tools->schema tools)]
+        (check "keyword keys work as well as string keys"
+               (= "kw" (get-in schema [:oneOf 0 :properties "name" :const]))))
 
       (section "Tools system prompt")
       (let [tools  [{"name" "test_tool" "description" "A test" "parameters" {"type" "object"}}]
