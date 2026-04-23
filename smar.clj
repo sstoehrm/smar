@@ -358,34 +358,34 @@
 
 ;; -- translate-request ------------------------------------------------------
 
-(defmulti translate-request (fn [backend-type _req] backend-type))
+(defmulti translate-request (fn [backend-type _req _schema] backend-type))
 
-(defmethod translate-request :ollama [_ req]
-  {:url    "/api/chat"
-   :body   {:model    (:model req)
-            :messages (:messages req)
-            :stream   (get req :stream false)
-            :options  (cond-> {}
-                        (:temperature req)    (assoc :temperature (:temperature req))
-                        (:max_tokens req)     (assoc :num_predict (:max_tokens req))
-                        (:top_p req)          (assoc :top_p (:top_p req))
-                        (:top_k req)          (assoc :top_k (:top_k req))
-                        (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}})
+(defn- response-format-json-schema [schema]
+  {:type "json_schema"
+   :json_schema {:name "smar_response" :strict true :schema schema}})
 
-(defmethod translate-request :koboldcpp [_ req]
-  (let [template-key (or (:smar_template req) (detect-template-from-model (:model req)))
-        prompt       (apply-template template-key (:messages req))]
-    {:url  "/api/v1/generate"
-     :body (cond-> {:prompt     prompt
-                    :max_length (or (:max_tokens req) 512)}
-             (:temperature req)    (assoc :temperature (:temperature req))
-             (:top_p req)          (assoc :top_p (:top_p req))
-             (:top_k req)          (assoc :top_k (:top_k req))
-             (:repeat_penalty req) (assoc :rep_pen (:repeat_penalty req)))}))
+(defmethod translate-request :ollama [_ req schema]
+  {:url  "/api/chat"
+   :body (cond-> {:model    (:model req)
+                  :messages (:messages req)
+                  :stream   (get req :stream false)
+                  :options  (cond-> {}
+                              (:temperature req)    (assoc :temperature (:temperature req))
+                              (:max_tokens req)     (assoc :num_predict (:max_tokens req))
+                              (:top_p req)          (assoc :top_p (:top_p req))
+                              (:top_k req)          (assoc :top_k (:top_k req))
+                              (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}
+           schema (assoc :format schema))})
 
-(defmethod translate-request :llamacpp [_ req]
+(defmethod translate-request :llamacpp [_ req schema]
   {:url  "/v1/chat/completions"
-   :body req})
+   :body (cond-> req
+           schema (assoc :response_format (response-format-json-schema schema)))})
+
+(defmethod translate-request :koboldcpp [_ req schema]
+  {:url  "/v1/chat/completions"
+   :body (cond-> req
+           schema (assoc :response_format (response-format-json-schema schema)))})
 
 ;; -- translate-response -----------------------------------------------------
 
@@ -407,9 +407,7 @@
      (get-in body [:message :content] ""))))
 
 (defmethod translate-response :koboldcpp [_ resp]
-  (let [body    (json/parse-string (:body resp) true)
-        content (get-in body [:results 0 :text] "")]
-    (openai-chat-response "koboldcpp" content)))
+  (json/parse-string (:body resp) true))
 
 (defmethod translate-response :llamacpp [_ resp]
   (json/parse-string (:body resp) true))
@@ -470,7 +468,7 @@
   (loop [attempt 0
          messages (:messages req)]
     (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req)
+          translated   (translate-request backend-type current-req nil)
           raw-resp     (forward-request base-url translated)
           openai-resp  (translate-response backend-type raw-resp)
           raw-content  (get-in openai-resp [:choices 0 :message :content] "")
@@ -494,7 +492,7 @@
   (loop [attempt 0
          messages (:messages req)]
     (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req)
+          translated   (translate-request backend-type current-req nil)
           raw-resp     (forward-request base-url translated)
           openai-resp  (translate-response backend-type raw-resp)
           content      (extract-json (get-in openai-resp [:choices 0 :message :content] ""))
@@ -616,8 +614,7 @@
               strat        (choose-strategy backend-type strategy)]
           (cond
             (= strat :grammar)
-            (let [translated (-> (translate-request backend-type openai-req)
-                                 (inject-grammar schema))
+            (let [translated (translate-request backend-type openai-req schema)
                   raw-resp   (backend-call #(forward-request target translated))
                   response   (translate-response backend-type raw-resp)
                   content    (get-in response [:choices 0 :message :content] "")
@@ -633,7 +630,7 @@
         :else
         (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
-              translated   (translate-request backend-type openai-req)
+              translated   (translate-request backend-type openai-req nil)
               raw-resp     (backend-call #(forward-request target translated))
               response     (translate-response backend-type raw-resp)]
           (println (json/generate-string response))))
@@ -844,20 +841,46 @@
         (check "prompt mentions tool name" (str/includes? prompt "test_tool"))
         (check "prompt mentions JSON format" (str/includes? prompt "\"name\"")))
 
-      (section "Request translation")
-      (let [req {:model "llama3" :messages [{:role "user" :content "hi"}]
-                 :temperature 0.5}]
-        (let [ollama (translate-request :ollama req)]
+      (section "Request translation (no schema)")
+      (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]
+                    :temperature 0.5}]
+        (let [ollama (translate-request :ollama req nil)]
           (check "ollama url" (= "/api/chat" (:url ollama)))
           (check "ollama passes messages" (= [{:role "user" :content "hi"}]
                                              (get-in ollama [:body :messages])))
-          (check "ollama maps temperature" (= 0.5 (get-in ollama [:body :options :temperature]))))
-        (let [kobold (translate-request :koboldcpp req)]
-          (check "koboldcpp url" (= "/api/v1/generate" (:url kobold)))
-          (check "koboldcpp has prompt" (string? (get-in kobold [:body :prompt]))))
-        (let [llama (translate-request :llamacpp req)]
+          (check "ollama maps temperature" (= 0.5 (get-in ollama [:body :options :temperature])))
+          (check "ollama has no :format when schema is nil"
+                 (nil? (get-in ollama [:body :format]))))
+        (let [kobold (translate-request :koboldcpp req nil)]
+          (check "koboldcpp uses OpenAI-compat url" (= "/v1/chat/completions" (:url kobold)))
+          (check "koboldcpp body has messages"
+                 (= [{:role "user" :content "hi"}] (get-in kobold [:body :messages])))
+          (check "koboldcpp has no :response_format when schema is nil"
+                 (nil? (get-in kobold [:body :response_format]))))
+        (let [llama (translate-request :llamacpp req nil)]
           (check "llamacpp url" (= "/v1/chat/completions" (:url llama)))
-          (check "llamacpp passes body through" (= req (:body llama)))))
+          (check "llamacpp passes body through" (= req (:body llama)))
+          (check "llamacpp has no :response_format when schema is nil"
+                 (nil? (get-in llama [:body :response_format])))))
+
+      (section "Request translation (with schema)")
+      (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]}
+            schema {:type "object" :properties {:x {:type "integer"}}}]
+        (let [ollama (translate-request :ollama req schema)]
+          (check "ollama :format equals schema"
+                 (= schema (get-in ollama [:body :format]))))
+        (let [llama (translate-request :llamacpp req schema)]
+          (check "llamacpp :response_format type"
+                 (= "json_schema" (get-in llama [:body :response_format :type])))
+          (check "llamacpp :response_format schema"
+                 (= schema (get-in llama [:body :response_format :json_schema :schema])))
+          (check "llamacpp :response_format strict"
+                 (true? (get-in llama [:body :response_format :json_schema :strict]))))
+        (let [kobold (translate-request :koboldcpp req schema)]
+          (check "koboldcpp :response_format schema"
+                 (= schema (get-in kobold [:body :response_format :json_schema :schema])))
+          (check "koboldcpp :response_format strict"
+                 (true? (get-in kobold [:body :response_format :json_schema :strict])))))
 
       (section "Response translation")
       (let [resp {:body (json/generate-string
@@ -867,9 +890,12 @@
         (check "ollama response has choices"
                (= "hello back" (get-in result [:choices 0 :message :content]))))
       (let [resp {:body (json/generate-string
-                         {:results [{:text "kobold says hi"}]})}
+                         {:model "kobold"
+                          :choices [{:index 0
+                                     :message {:role "assistant" :content "kobold says hi"}
+                                     :finish_reason "stop"}]})}
             result (translate-response :koboldcpp resp)]
-        (check "koboldcpp response extracts text"
+        (check "koboldcpp response parses OpenAI-compat shape"
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
