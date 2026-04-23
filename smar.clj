@@ -123,47 +123,6 @@
       :else                            :chatml)))
 
 ;; ---------------------------------------------------------------------------
-;; GBNF grammar generation from JSON schema
-;; ---------------------------------------------------------------------------
-
-(defn json-schema->gbnf [schema]
-  (letfn [(type->rule [s path]
-            (let [t    (get s "type" (get s :type))
-                  enum (get s "enum" (get s :enum))]
-              (if enum
-                (str "(" (str/join " | "
-                           (map (fn [v]
-                                  (if (string? v)
-                                    (str "\"\\\"" v "\\\"\"")
-                                    (str "\"" v "\"")))
-                                enum))
-                     ")")
-                (case t
-                  "string"  "\"\\\"\" [^\"\\\\]* \"\\\"\" "
-                "number"  "[\"-\"]? [0-9]+ (\".\" [0-9]+)?"
-                "integer" "[\"-\"]? [0-9]+"
-                "boolean" "(\"true\" | \"false\")"
-                "null"    "\"null\""
-                "array"   (let [items (get s "items" (get s :items))]
-                            (str "\"[\" ws "
-                                 (type->rule items (conj path "item"))
-                                 " (\",\" ws " (type->rule items (conj path "item")) ")* "
-                                 "ws \"]\""))
-                "object"  (let [props (get s "properties" (get s :properties))
-                                keys  (sort (keys props))]
-                            (str "\"{\" ws "
-                                 (str/join " \",\" ws "
-                                           (map (fn [k]
-                                                  (str "\"\\\"" (name k) "\\\":\" ws "
-                                                       (type->rule (get props k) (conj path (name k)))))
-                                                keys))
-                                 " ws \"}\""))
-                  ;; fallback
-                  "[^\\x00]*"))))]
-    (str "root ::= " (type->rule schema []) "\n"
-         "ws ::= [ \\t\\n]*\n")))
-
-;; ---------------------------------------------------------------------------
 ;; Schema validation (malli)
 ;; ---------------------------------------------------------------------------
 
@@ -435,27 +394,15 @@
     (catch Exception _
       [{:id "llamacpp" :object "model" :owned_by "llamacpp"}])))
 
-;; -- supports-grammar? ------------------------------------------------------
-
-(defmulti supports-grammar? identity)
-(defmethod supports-grammar? :llamacpp [_] true)
-(defmethod supports-grammar? :koboldcpp [_] true)
-(defmethod supports-grammar? :ollama [_] false)
-
 ;; ---------------------------------------------------------------------------
 ;; Structured output: strategy selection & retry
 ;; ---------------------------------------------------------------------------
 
-(defn choose-strategy [backend-type strategy-override]
+(defn choose-strategy [_backend-type strategy-override]
   (cond
     (= strategy-override "grammar")  :grammar
     (= strategy-override "validate") :validate
-    (supports-grammar? backend-type) :grammar
-    :else :validate))
-
-(defn inject-grammar [translated-req json-schema]
-  (let [grammar (json-schema->gbnf json-schema)]
-    (update translated-req :body assoc :grammar grammar)))
+    :else                            :grammar))
 
 (defn forward-request [base-url translated]
   (let [url  (str base-url (:url translated))
@@ -463,53 +410,6 @@
     @(client/post url {:headers {"content-type" "application/json"}
                        :body    body
                        :timeout 30000})))
-
-(defn complete-with-validation [base-url backend-type req json-schema max-retries]
-  (loop [attempt 0
-         messages (:messages req)]
-    (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req nil)
-          raw-resp     (forward-request base-url translated)
-          openai-resp  (translate-response backend-type raw-resp)
-          raw-content  (get-in openai-resp [:choices 0 :message :content] "")
-          content      (extract-json raw-content)
-          openai-resp  (assoc-in openai-resp [:choices 0 :message :content] content)
-          validation   (validate-response json-schema content)]
-      (if (:valid validation)
-        openai-resp
-        (if (>= attempt max-retries)
-          (assoc openai-resp
-                 :smar_validation {:valid false :errors (:errors validation)})
-          (recur (inc attempt)
-                 (conj (vec messages)
-                       {:role "assistant" :content content}
-                       {:role "user"
-                        :content (str "Your response did not match the required schema. "
-                                      "Errors: " (pr-str (:errors validation)) "\n"
-                                      "Please try again and respond with valid JSON.")})))))))
-
-(defn complete-with-tool-validation [base-url backend-type req tools max-retries]
-  (loop [attempt 0
-         messages (:messages req)]
-    (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req nil)
-          raw-resp     (forward-request base-url translated)
-          openai-resp  (translate-response backend-type raw-resp)
-          content      (extract-json (get-in openai-resp [:choices 0 :message :content] ""))
-          validation   (validate-tool-call tools content)]
-      (if (:valid validation)
-        (tool-call-response (:model req) (:tool-call validation))
-        (if (>= attempt max-retries)
-          (assoc openai-resp
-                 :smar_validation {:valid false :errors (:errors validation)})
-          (recur (inc attempt)
-                 (conj (vec messages)
-                       {:role "assistant" :content content}
-                       {:role "user"
-                        :content (str "Your response was not a valid tool call. "
-                                      "Error: " (:errors validation) "\n"
-                                      "You MUST respond with ONLY a JSON object: "
-                                      "{\"name\": \"<tool_name>\", \"arguments\": {...}}")})))))))
 
 (defn complete-with-constraint
   "Unified loop for schema-constrained and tool-constrained completions.
@@ -723,33 +623,6 @@
       (check "detect fallback to chatml"
              (= :chatml (detect-template-from-model "some-random-model")))
 
-      (section "GBNF generation")
-      (let [gbnf (json-schema->gbnf {"type" "object"
-                                     "properties" {"name" {"type" "string"}
-                                                   "age"  {"type" "integer"}}})]
-        (check "gbnf has root rule" (str/includes? gbnf "root ::="))
-        (check "gbnf has ws rule" (str/includes? gbnf "ws ::="))
-        (check "gbnf references name field" (str/includes? gbnf "name"))
-        (check "gbnf references age field" (str/includes? gbnf "age")))
-      ;; keyword keys should produce clean JSON keys (no leading colons)
-      (let [gbnf (json-schema->gbnf {:type "object"
-                                     :properties {:content {:type "string"}
-                                                  :mood    {:type "string"}}})]
-        (check "keyword keys have no colons"
-               (and (str/includes? gbnf "content")
-                    (not (str/includes? gbnf ":content"))
-                    (str/includes? gbnf "mood")
-                    (not (str/includes? gbnf ":mood")))))
-      ;; enum values should be constrained
-      (let [gbnf (json-schema->gbnf {"type" "object"
-                                     "properties" {"color" {"type" "string"
-                                                            "enum" ["red" "blue" "green"]}}})]
-        (check "enum generates alternation"
-               (and (str/includes? gbnf "red")
-                    (str/includes? gbnf "blue")
-                    (str/includes? gbnf "green")
-                    (str/includes? gbnf "|"))))
-
       (section "Content extraction")
       (check "clean json passes through"
              (= "{\"a\":1}" (extract-json "{\"a\":1}")))
@@ -928,10 +801,6 @@
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
-      (check "grammar when supported"
-             (= :grammar (choose-strategy :llamacpp nil)))
-      (check "validate when not supported"
-             (= :validate (choose-strategy :ollama nil)))
       (check "override to validate"
              (= :validate (choose-strategy :llamacpp "validate")))
       (check "override to grammar"
