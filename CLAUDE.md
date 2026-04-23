@@ -72,12 +72,24 @@ Each file: `{:family "name" :template :key :defaults {:temperature ...} :descrip
 ## Backend detection
 
 Auto-detects by probing: `/api/tags` -> ollama, `/api/v1/model` -> koboldcpp, else -> llamacpp.
-Translation via multimethods: `translate-request`, `translate-response`, `list-models-remote`.
+Translation via multimethods: `translate-request` (takes schema as a 3rd arg),
+`translate-response`, `list-models-remote`. koboldcpp uses the OpenAI-compat
+endpoint (`/v1/chat/completions`), so no client-side chat-template application
+is needed.
 
 ## Structured output
 
-Two strategies: GBNF grammar injection (llamacpp, koboldcpp) or validate+retry with malli (ollama).
-Override via `smar_strategy` field in the request body (`grammar` or `validate`).
+`smar_schema` triggers decode-time constraint on the backend. Each backend places
+the schema in its native field:
+
+- ollama: `{:format <schema>}` on `/api/chat` (Ollama >= 0.5)
+- llama.cpp: `{:response_format {:type "json_schema" :json_schema {:schema <s> :strict true}}}` on `/v1/chat/completions`
+- koboldcpp: same as llama.cpp on `/v1/chat/completions` (koboldcpp >= 1.68)
+
+After decoding, smar runs `extract-json` + malli validation as a safety net, with
+up to 3 retries on validation failure. Override the default grammar-constrained
+flow via `smar_strategy: "validate"` to skip native constraint (useful when a
+specific model misbehaves when grammar-locked).
 
 ## Tool calling
 

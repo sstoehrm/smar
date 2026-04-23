@@ -10,6 +10,8 @@ Auto-detects backend type (Ollama, KoboldCPP, llama.cpp) and translates requests
 
 [Babashka](https://github.com/babashka/babashka) >= 1.12.215 (deps are fetched automatically on first run).
 
+**Backend minimums:** Ollama >= 0.5, koboldcpp >= 1.68, recent llama.cpp server builds. These are the versions that support native JSON-schema constrained decoding.
+
 ## Usage
 
 ```
@@ -69,7 +71,7 @@ The `complete` command mode is determined by which fields are present in the req
 | Field | Mode | Description |
 |---|---|---|
 | (none) | plain | Direct completion, response passed through |
-| `smar_schema` | JSON | Enforce structured output via GBNF grammar or validate+retry |
+| `smar_schema` | JSON | Enforce structured output via backend-native JSON Schema, with validate-and-retry safety net |
 | `smar_tools` | tools | Enforce valid tool call response, retry if invalid |
 
 `smar_schema` and `smar_tools` are mutually exclusive.
@@ -93,7 +95,6 @@ Available families: `llama3`, `mistral`, `gemma2`, `phi4`, `qwen25`, `qwen3`, `q
 
 ## Limitations
 
-- Grammar strategy (GBNF) trusts the backend to enforce structure — no post-validation
 - Streaming support is limited to Ollama passthrough
 - No authentication or rate limiting
 - Tool calling: smar enforces format only, does not execute tools

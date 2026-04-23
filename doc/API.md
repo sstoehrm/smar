@@ -175,15 +175,24 @@ smar validates that the LLM response is a valid tool call (correct tool name, ar
 
 ## Structured Output Strategies
 
-smar picks a strategy automatically based on backend type:
+smar uses decode-time native constraint on all backends by default:
 
 | Backend | Strategy | Mechanism |
 |---|---|---|
-| llama.cpp | grammar | GBNF grammar injected into request |
-| KoboldCPP | grammar | GBNF grammar injected into request |
-| Ollama | validate | Generate freely, validate with malli, retry on failure (up to 3 times) |
+| llama.cpp | grammar | `response_format: {type: "json_schema", ...}` on the OpenAI-compat endpoint |
+| koboldcpp | grammar | `response_format: {type: "json_schema", ...}` on the OpenAI-compat endpoint |
+| Ollama | grammar | `format: <schema>` on `/api/chat` |
 
-Override with the `smar_strategy` field in the request body (`grammar` or `validate`).
+Set `smar_strategy: "validate"` to skip native constraint and fall back to
+validate-and-retry only. Useful when a specific model produces garbage under
+grammar-lock.
+
+Both strategies run `extract-json` + malli validation after each response; the
+retry loop re-prompts with error context on failure (up to 3 times). When all
+retries exhaust, the response includes `smar_validation: {valid: false, errors: ...}`.
+
+**Minimum backend versions:** Ollama >= 0.5, koboldcpp >= 1.68 (for OpenAI-compat
+`response_format: json_schema` support), recent llama.cpp server builds.
 
 When validation fails after all retries, the response includes a `smar_validation` field:
 
