@@ -23,7 +23,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.3.0")
+(def smar-version "0.4.0")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -51,117 +51,6 @@
     (merge (:defaults preset) openai-req)
     openai-req))
 
-(defn get-preset-template [model-family]
-  (when-let [preset (get model-presets model-family)]
-    (:template preset)))
-
-;; ---------------------------------------------------------------------------
-;; Chat templates
-;; ---------------------------------------------------------------------------
-
-(def templates
-  {:chatml
-   {:bos    ""
-    :eos    ""
-    :start  (fn [role] (str "<|im_start|>" role "\n"))
-    :end    "<|im_end|>\n"
-    :suffix "<|im_start|>assistant\n"}
-
-   :llama3
-   {:bos    "<|begin_of_text|>"
-    :eos    "<|end_of_text|>"
-    :start  (fn [role] (str "<|start_header_id|>" role "<|end_header_id|>\n\n"))
-    :end    "<|eot_id|>\n"
-    :suffix "<|start_header_id|>assistant<|end_header_id|>\n\n"}
-
-   :mistral
-   {:bos    "<s>"
-    :eos    "</s>"
-    :start  (fn [role] (if (= role "user") "[INST] " ""))
-    :end    (fn [role] (if (= role "user") " [/INST]" "</s>"))
-    :suffix ""}
-
-   :gemma2
-   {:bos    "<bos>"
-    :eos    ""
-    :start  (fn [role] (str "<start_of_turn>"
-                            (case role "assistant" "model" role)
-                            "\n"))
-    :end    "<end_of_turn>\n"
-    :suffix "<start_of_turn>model\n"}
-
-   :gemma4
-   {:bos    ""
-    :eos    ""
-    :start  (fn [role] (str "<|turn>"
-                            (case role "assistant" "model" role)
-                            "\n"))
-    :end    "<turn|>\n"
-    :suffix "<|turn>model\n"}})
-
-(defn apply-template [template-key messages]
-  (let [tmpl (get templates template-key (:chatml templates))]
-    (str (:bos tmpl)
-         (apply str
-                (for [{:keys [role content]} messages]
-                  (let [start-fn (:start tmpl)
-                        end-val  (:end tmpl)
-                        start    (if (fn? start-fn) (start-fn role) start-fn)
-                        end      (if (fn? end-val) (end-val role) end-val)]
-                    (str start content end))))
-         (:suffix tmpl))))
-
-(defn detect-template-from-model [model-name]
-  (let [lower (str/lower-case (or model-name ""))]
-    (cond
-      (str/includes? lower "llama-3")  :llama3
-      (str/includes? lower "llama3")   :llama3
-      (str/includes? lower "mistral")  :mistral
-      (or (str/includes? lower "gemma-4")
-          (str/includes? lower "gemma4"))  :gemma4
-      (str/includes? lower "gemma")    :gemma2
-      :else                            :chatml)))
-
-;; ---------------------------------------------------------------------------
-;; GBNF grammar generation from JSON schema
-;; ---------------------------------------------------------------------------
-
-(defn json-schema->gbnf [schema]
-  (letfn [(type->rule [s path]
-            (let [t    (get s "type" (get s :type))
-                  enum (get s "enum" (get s :enum))]
-              (if enum
-                (str "(" (str/join " | "
-                           (map (fn [v]
-                                  (if (string? v)
-                                    (str "\"\\\"" v "\\\"\"")
-                                    (str "\"" v "\"")))
-                                enum))
-                     ")")
-                (case t
-                  "string"  "\"\\\"\" [^\"\\\\]* \"\\\"\" "
-                "number"  "[\"-\"]? [0-9]+ (\".\" [0-9]+)?"
-                "integer" "[\"-\"]? [0-9]+"
-                "boolean" "(\"true\" | \"false\")"
-                "null"    "\"null\""
-                "array"   (let [items (get s "items" (get s :items))]
-                            (str "\"[\" ws "
-                                 (type->rule items (conj path "item"))
-                                 " (\",\" ws " (type->rule items (conj path "item")) ")* "
-                                 "ws \"]\""))
-                "object"  (let [props (get s "properties" (get s :properties))
-                                keys  (sort (keys props))]
-                            (str "\"{\" ws "
-                                 (str/join " \",\" ws "
-                                           (map (fn [k]
-                                                  (str "\"\\\"" (name k) "\\\":\" ws "
-                                                       (type->rule (get props k) (conj path (name k)))))
-                                                keys))
-                                 " ws \"}\""))
-                  ;; fallback
-                  "[^\\x00]*"))))]
-    (str "root ::= " (type->rule schema []) "\n"
-         "ws ::= [ \\t\\n]*\n")))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema validation (malli)
@@ -266,6 +155,22 @@
 ;; Tool call validation
 ;; ---------------------------------------------------------------------------
 
+(defn tools->schema
+  "Synthesise a JSON Schema (oneOf) that matches any valid tool call over `tools`.
+   Used as the decode-time constraint on the `smar_tools` path."
+  [tools]
+  {:oneOf
+   (mapv (fn [tool]
+           (let [name   (get tool "name" (get tool :name))
+                 params (or (get tool "parameters" (get tool :parameters))
+                            {:type "object"})]
+             {:type "object"
+              :additionalProperties false
+              :required ["name" "arguments"]
+              :properties {"name"      {:const name}
+                           "arguments" params}}))
+         tools)})
+
 (defn build-tools-system-prompt [tools]
   (str "You have access to the following tools:\n\n"
        (str/join "\n\n"
@@ -342,34 +247,34 @@
 
 ;; -- translate-request ------------------------------------------------------
 
-(defmulti translate-request (fn [backend-type _req] backend-type))
+(defmulti translate-request (fn [backend-type _req _schema] backend-type))
 
-(defmethod translate-request :ollama [_ req]
-  {:url    "/api/chat"
-   :body   {:model    (:model req)
-            :messages (:messages req)
-            :stream   (get req :stream false)
-            :options  (cond-> {}
-                        (:temperature req)    (assoc :temperature (:temperature req))
-                        (:max_tokens req)     (assoc :num_predict (:max_tokens req))
-                        (:top_p req)          (assoc :top_p (:top_p req))
-                        (:top_k req)          (assoc :top_k (:top_k req))
-                        (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}})
+(defn- response-format-json-schema [schema]
+  {:type "json_schema"
+   :json_schema {:name "smar_response" :strict true :schema schema}})
 
-(defmethod translate-request :koboldcpp [_ req]
-  (let [template-key (or (:smar_template req) (detect-template-from-model (:model req)))
-        prompt       (apply-template template-key (:messages req))]
-    {:url  "/api/v1/generate"
-     :body (cond-> {:prompt     prompt
-                    :max_length (or (:max_tokens req) 512)}
-             (:temperature req)    (assoc :temperature (:temperature req))
-             (:top_p req)          (assoc :top_p (:top_p req))
-             (:top_k req)          (assoc :top_k (:top_k req))
-             (:repeat_penalty req) (assoc :rep_pen (:repeat_penalty req)))}))
+(defmethod translate-request :ollama [_ req schema]
+  {:url  "/api/chat"
+   :body (cond-> {:model    (:model req)
+                  :messages (:messages req)
+                  :stream   (get req :stream false)
+                  :options  (cond-> {}
+                              (:temperature req)    (assoc :temperature (:temperature req))
+                              (:max_tokens req)     (assoc :num_predict (:max_tokens req))
+                              (:top_p req)          (assoc :top_p (:top_p req))
+                              (:top_k req)          (assoc :top_k (:top_k req))
+                              (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}
+           schema (assoc :format schema))})
 
-(defmethod translate-request :llamacpp [_ req]
+(defmethod translate-request :llamacpp [_ req schema]
   {:url  "/v1/chat/completions"
-   :body req})
+   :body (cond-> req
+           schema (assoc :response_format (response-format-json-schema schema)))})
+
+(defmethod translate-request :koboldcpp [_ req schema]
+  {:url  "/v1/chat/completions"
+   :body (cond-> req
+           schema (assoc :response_format (response-format-json-schema schema)))})
 
 ;; -- translate-response -----------------------------------------------------
 
@@ -391,9 +296,7 @@
      (get-in body [:message :content] ""))))
 
 (defmethod translate-response :koboldcpp [_ resp]
-  (let [body    (json/parse-string (:body resp) true)
-        content (get-in body [:results 0 :text] "")]
-    (openai-chat-response "koboldcpp" content)))
+  (json/parse-string (:body resp) true))
 
 (defmethod translate-response :llamacpp [_ resp]
   (json/parse-string (:body resp) true))
@@ -421,27 +324,14 @@
     (catch Exception _
       [{:id "llamacpp" :object "model" :owned_by "llamacpp"}])))
 
-;; -- supports-grammar? ------------------------------------------------------
-
-(defmulti supports-grammar? identity)
-(defmethod supports-grammar? :llamacpp [_] true)
-(defmethod supports-grammar? :koboldcpp [_] true)
-(defmethod supports-grammar? :ollama [_] false)
-
 ;; ---------------------------------------------------------------------------
 ;; Structured output: strategy selection & retry
 ;; ---------------------------------------------------------------------------
 
-(defn choose-strategy [backend-type strategy-override]
-  (cond
-    (= strategy-override "grammar")  :grammar
-    (= strategy-override "validate") :validate
-    (supports-grammar? backend-type) :grammar
-    :else :validate))
-
-(defn inject-grammar [translated-req json-schema]
-  (let [grammar (json-schema->gbnf json-schema)]
-    (update translated-req :body assoc :grammar grammar)))
+(defn choose-strategy [strategy-override]
+  (case strategy-override
+    "validate" :validate
+    :grammar))
 
 (defn forward-request [base-url translated]
   (let [url  (str base-url (:url translated))
@@ -450,19 +340,24 @@
                        :body    body
                        :timeout 30000})))
 
-(defn complete-with-validation [base-url backend-type req json-schema max-retries]
-  (loop [attempt 0
+(defn complete-with-constraint
+  "Unified loop for schema-constrained and tool-constrained completions.
+   - `schema` is passed to translate-request (nil on the :validate path).
+   - `validator` is called on extracted content; it returns {:valid bool :errors ... :data? ...}.
+   - `on-valid` wraps a successful result (identity for schema, tool-call-response wrapper for tools)."
+  [base-url backend-type req schema validator on-valid max-retries]
+  (loop [attempt  0
          messages (:messages req)]
-    (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req)
-          raw-resp     (forward-request base-url translated)
-          openai-resp  (translate-response backend-type raw-resp)
-          raw-content  (get-in openai-resp [:choices 0 :message :content] "")
-          content      (extract-json raw-content)
-          openai-resp  (assoc-in openai-resp [:choices 0 :message :content] content)
-          validation   (validate-response json-schema content)]
+    (let [current-req (assoc req :messages messages)
+          translated  (translate-request backend-type current-req schema)
+          raw-resp    (forward-request base-url translated)
+          openai-resp (translate-response backend-type raw-resp)
+          raw-content (get-in openai-resp [:choices 0 :message :content] "")
+          content     (extract-json raw-content)
+          openai-resp (assoc-in openai-resp [:choices 0 :message :content] content)
+          validation  (validator content)]
       (if (:valid validation)
-        openai-resp
+        (on-valid openai-resp validation)
         (if (>= attempt max-retries)
           (assoc openai-resp
                  :smar_validation {:valid false :errors (:errors validation)})
@@ -470,36 +365,22 @@
                  (conj (vec messages)
                        {:role "assistant" :content content}
                        {:role "user"
-                        :content (str "Your response did not match the required schema. "
+                        :content (str "Your previous response was invalid. "
                                       "Errors: " (pr-str (:errors validation)) "\n"
-                                      "Please try again and respond with valid JSON.")})))))))
-
-(defn complete-with-tool-validation [base-url backend-type req tools max-retries]
-  (loop [attempt 0
-         messages (:messages req)]
-    (let [current-req  (assoc req :messages messages)
-          translated   (translate-request backend-type current-req)
-          raw-resp     (forward-request base-url translated)
-          openai-resp  (translate-response backend-type raw-resp)
-          content      (extract-json (get-in openai-resp [:choices 0 :message :content] ""))
-          validation   (validate-tool-call tools content)]
-      (if (:valid validation)
-        (tool-call-response (:model req) (:tool-call validation))
-        (if (>= attempt max-retries)
-          (assoc openai-resp
-                 :smar_validation {:valid false :errors (:errors validation)})
-          (recur (inc attempt)
-                 (conj (vec messages)
-                       {:role "assistant" :content content}
-                       {:role "user"
-                        :content (str "Your response was not a valid tool call. "
-                                      "Error: " (:errors validation) "\n"
-                                      "You MUST respond with ONLY a JSON object: "
-                                      "{\"name\": \"<tool_name>\", \"arguments\": {...}}")})))))))
+                                      "Please try again.")})))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Request handling
 ;; ---------------------------------------------------------------------------
+
+(defn valid-strategy? [s]
+  (or (nil? s) (contains? #{"grammar" "validate"} s)))
+
+(defn valid-tools? [t]
+  (boolean (and (sequential? t) (seq t))))
+
+(defn valid-schema? [s]
+  (map? s))
 
 (defn extract-smar-fields [parsed-body]
   (let [target       (:smar_target parsed-body)
@@ -523,11 +404,7 @@
     (vec (cons system-msg messages))))
 
 (defn prepare-request [body model-family]
-  (let [preset-template (get-preset-template model-family)
-        req             (apply-model-preset body model-family)]
-    (if preset-template
-      (assoc req :smar_template preset-template)
-      req)))
+  (apply-model-preset body model-family))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI — error output and dispatch
@@ -582,45 +459,52 @@
                       (cli-error 1 (str "Invalid JSON on stdin: " (.getMessage e)))))]
     (if-let [{:keys [target schema tools model-family backend strategy body]}
              (extract-smar-fields parsed)]
-      (cond
-        (and schema tools)
-        (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
+      (do
+        (when-not (valid-strategy? strategy)
+          (cli-error 1 (str "Invalid smar_strategy: " (pr-str strategy)
+                            ". Must be \"grammar\" or \"validate\".")))
+        (when (and tools (not (valid-tools? tools)))
+          (cli-error 1 "smar_tools must be a non-empty array"))
+        (when (and schema (not (valid-schema? schema)))
+          (cli-error 1 "smar_schema must be a JSON Schema object"))
+        (cond
+          (and schema tools)
+          (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
 
-        tools
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (-> (prepare-request body model-family)
-                               (update :messages inject-tools-prompt tools))
-              response     (backend-call
-                            #(complete-with-tool-validation target backend-type openai-req tools 3))]
-          (println (json/generate-string response)))
+          tools
+          (let [backend-type  (resolve-backend-type target backend)
+                openai-req    (-> (prepare-request body model-family)
+                                  (update :messages inject-tools-prompt tools))
+                strat         (choose-strategy strategy)
+                constraint    (when (= strat :grammar) (tools->schema tools))
+                validator     (fn [content] (validate-tool-call tools content))
+                on-valid      (fn [_ validation]
+                                (tool-call-response (:model openai-req)
+                                                    (:tool-call validation)))
+                response      (backend-call
+                               #(complete-with-constraint target backend-type openai-req
+                                                          constraint validator on-valid 3))]
+            (println (json/generate-string response)))
 
-        schema
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (prepare-request body model-family)
-              strat        (choose-strategy backend-type strategy)]
-          (cond
-            (= strat :grammar)
-            (let [translated (-> (translate-request backend-type openai-req)
-                                 (inject-grammar schema))
-                  raw-resp   (backend-call #(forward-request target translated))
-                  response   (translate-response backend-type raw-resp)
-                  content    (get-in response [:choices 0 :message :content] "")
-                  response   (assoc-in response [:choices 0 :message :content]
-                                       (extract-json content))]
-              (println (json/generate-string response)))
+          schema
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                strat        (choose-strategy strategy)
+                constraint   (when (= strat :grammar) schema)
+                validator    (fn [content] (validate-response schema content))
+                on-valid     (fn [openai-resp _] openai-resp)
+                response     (backend-call
+                              #(complete-with-constraint target backend-type openai-req
+                                                         constraint validator on-valid 3))]
+            (println (json/generate-string response)))
 
-            :else
-            (let [response (backend-call
-                            #(complete-with-validation target backend-type openai-req schema 3))]
-              (println (json/generate-string response)))))
-
-        :else
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (prepare-request body model-family)
-              translated   (translate-request backend-type openai-req)
-              raw-resp     (backend-call #(forward-request target translated))
-              response     (translate-response backend-type raw-resp)]
-          (println (json/generate-string response))))
+          :else
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                translated   (translate-request backend-type openai-req nil)
+                raw-resp     (backend-call #(forward-request target translated))
+                response     (translate-response backend-type raw-resp)]
+            (println (json/generate-string response)))))
       (cli-error 1 "Missing required field: smar_target"))))
 
 ;; ---------------------------------------------------------------------------
@@ -641,72 +525,6 @@
             (section [title]
               (println)
               (println (str "-- " title " --")))]
-
-      (section "Chat templates")
-      (let [result (apply-template :chatml [{:role "user" :content "hello"}])]
-        (check "chatml wraps user message"
-               (and (str/includes? result "<|im_start|>user")
-                    (str/includes? result "hello")
-                    (str/includes? result "<|im_end|>"))))
-      (let [result (apply-template :llama3 [{:role "user" :content "hi"}])]
-        (check "llama3 template"
-               (and (str/includes? result "<|begin_of_text|>")
-                    (str/includes? result "<|start_header_id|>user"))))
-      (let [result (apply-template :gemma2 [{:role "user" :content "hi"}
-                                             {:role "assistant" :content "hello"}])]
-        (check "gemma2 template uses start_of_turn"
-               (and (str/includes? result "<bos>")
-                    (str/includes? result "<start_of_turn>user")
-                    (str/includes? result "<start_of_turn>model\nhello")
-                    (str/includes? result "<end_of_turn>")
-                    (str/ends-with? result "<start_of_turn>model\n"))))
-      (let [result (apply-template :gemma4 [{:role "system" :content "sys"}
-                                             {:role "user" :content "hi"}
-                                             {:role "assistant" :content "hello"}])]
-        (check "gemma4 template uses turn delimiters"
-               (and (str/includes? result "<|turn>system\nsys<turn|>")
-                    (str/includes? result "<|turn>user\nhi<turn|>")
-                    (str/includes? result "<|turn>model\nhello<turn|>")
-                    (str/ends-with? result "<|turn>model\n"))))
-      (check "detect llama3 model"
-             (= :llama3 (detect-template-from-model "meta-llama3-8b")))
-      (check "detect mistral model"
-             (= :mistral (detect-template-from-model "Mistral-7B")))
-      (check "detect gemma-4 model"
-             (= :gemma4 (detect-template-from-model "gemma-4-26B-A4B-it")))
-      (check "detect gemma4 model (no dash)"
-             (= :gemma4 (detect-template-from-model "gemma4:e4b")))
-      (check "detect gemma-2 model"
-             (= :gemma2 (detect-template-from-model "gemma-2-9b-it")))
-      (check "detect fallback to chatml"
-             (= :chatml (detect-template-from-model "some-random-model")))
-
-      (section "GBNF generation")
-      (let [gbnf (json-schema->gbnf {"type" "object"
-                                     "properties" {"name" {"type" "string"}
-                                                   "age"  {"type" "integer"}}})]
-        (check "gbnf has root rule" (str/includes? gbnf "root ::="))
-        (check "gbnf has ws rule" (str/includes? gbnf "ws ::="))
-        (check "gbnf references name field" (str/includes? gbnf "name"))
-        (check "gbnf references age field" (str/includes? gbnf "age")))
-      ;; keyword keys should produce clean JSON keys (no leading colons)
-      (let [gbnf (json-schema->gbnf {:type "object"
-                                     :properties {:content {:type "string"}
-                                                  :mood    {:type "string"}}})]
-        (check "keyword keys have no colons"
-               (and (str/includes? gbnf "content")
-                    (not (str/includes? gbnf ":content"))
-                    (str/includes? gbnf "mood")
-                    (not (str/includes? gbnf ":mood")))))
-      ;; enum values should be constrained
-      (let [gbnf (json-schema->gbnf {"type" "object"
-                                     "properties" {"color" {"type" "string"
-                                                            "enum" ["red" "blue" "green"]}}})]
-        (check "enum generates alternation"
-               (and (str/includes? gbnf "red")
-                    (str/includes? gbnf "blue")
-                    (str/includes? gbnf "green")
-                    (str/includes? gbnf "|"))))
 
       (section "Content extraction")
       (check "clean json passes through"
@@ -785,26 +603,89 @@
                (:valid (validate-tool-call tools
                          "{\"name\":\"search\",\"arguments\":{\"query\":\"weather Berlin\"}}"))))
 
+      (section "Tools schema synthesis")
+      (let [tools  [{"name" "get_weather"
+                     "description" "Get weather"
+                     "parameters" {"type" "object"
+                                   "properties" {"city" {"type" "string"}}
+                                   "required" ["city"]}}
+                    {"name" "search"
+                     "description" "Search"
+                     "parameters" {"type" "object"
+                                   "properties" {"query" {"type" "string"}}
+                                   "required" ["query"]}}]
+            schema (tools->schema tools)]
+        (check "schema is oneOf"
+               (and (map? schema) (vector? (:oneOf schema))))
+        (check "one branch per tool"
+               (= 2 (count (:oneOf schema))))
+        (check "first branch pins name to const"
+               (= "get_weather" (get-in schema [:oneOf 0 :properties "name" :const])))
+        (check "first branch attaches parameters as arguments schema"
+               (= {"type" "object"
+                   "properties" {"city" {"type" "string"}}
+                   "required" ["city"]}
+                  (get-in schema [:oneOf 0 :properties "arguments"])))
+        (check "branches forbid extra keys"
+               (false? (get-in schema [:oneOf 0 :additionalProperties])))
+        (check "branches require name and arguments"
+               (= ["name" "arguments"] (get-in schema [:oneOf 0 :required]))))
+      (let [tools  [{"name" "noop" "description" "." "parameters" nil}]
+            schema (tools->schema tools)]
+        (check "missing parameters defaults to object schema"
+               (= {:type "object"}
+                  (get-in schema [:oneOf 0 :properties "arguments"]))))
+      (let [tools  [{:name "kw" :description "." :parameters {:type "object"}}]
+            schema (tools->schema tools)]
+        (check "keyword keys work as well as string keys"
+               (= "kw" (get-in schema [:oneOf 0 :properties "name" :const]))))
+
       (section "Tools system prompt")
       (let [tools  [{"name" "test_tool" "description" "A test" "parameters" {"type" "object"}}]
             prompt (build-tools-system-prompt tools)]
         (check "prompt mentions tool name" (str/includes? prompt "test_tool"))
         (check "prompt mentions JSON format" (str/includes? prompt "\"name\"")))
 
-      (section "Request translation")
-      (let [req {:model "llama3" :messages [{:role "user" :content "hi"}]
-                 :temperature 0.5}]
-        (let [ollama (translate-request :ollama req)]
+      (section "Request translation (no schema)")
+      (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]
+                    :temperature 0.5}]
+        (let [ollama (translate-request :ollama req nil)]
           (check "ollama url" (= "/api/chat" (:url ollama)))
           (check "ollama passes messages" (= [{:role "user" :content "hi"}]
                                              (get-in ollama [:body :messages])))
-          (check "ollama maps temperature" (= 0.5 (get-in ollama [:body :options :temperature]))))
-        (let [kobold (translate-request :koboldcpp req)]
-          (check "koboldcpp url" (= "/api/v1/generate" (:url kobold)))
-          (check "koboldcpp has prompt" (string? (get-in kobold [:body :prompt]))))
-        (let [llama (translate-request :llamacpp req)]
+          (check "ollama maps temperature" (= 0.5 (get-in ollama [:body :options :temperature])))
+          (check "ollama has no :format when schema is nil"
+                 (nil? (get-in ollama [:body :format]))))
+        (let [kobold (translate-request :koboldcpp req nil)]
+          (check "koboldcpp uses OpenAI-compat url" (= "/v1/chat/completions" (:url kobold)))
+          (check "koboldcpp body has messages"
+                 (= [{:role "user" :content "hi"}] (get-in kobold [:body :messages])))
+          (check "koboldcpp has no :response_format when schema is nil"
+                 (nil? (get-in kobold [:body :response_format]))))
+        (let [llama (translate-request :llamacpp req nil)]
           (check "llamacpp url" (= "/v1/chat/completions" (:url llama)))
-          (check "llamacpp passes body through" (= req (:body llama)))))
+          (check "llamacpp passes body through" (= req (:body llama)))
+          (check "llamacpp has no :response_format when schema is nil"
+                 (nil? (get-in llama [:body :response_format])))))
+
+      (section "Request translation (with schema)")
+      (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]}
+            schema {:type "object" :properties {:x {:type "integer"}}}]
+        (let [ollama (translate-request :ollama req schema)]
+          (check "ollama :format equals schema"
+                 (= schema (get-in ollama [:body :format]))))
+        (let [llama (translate-request :llamacpp req schema)]
+          (check "llamacpp :response_format type"
+                 (= "json_schema" (get-in llama [:body :response_format :type])))
+          (check "llamacpp :response_format schema"
+                 (= schema (get-in llama [:body :response_format :json_schema :schema])))
+          (check "llamacpp :response_format strict"
+                 (true? (get-in llama [:body :response_format :json_schema :strict]))))
+        (let [kobold (translate-request :koboldcpp req schema)]
+          (check "koboldcpp :response_format schema"
+                 (= schema (get-in kobold [:body :response_format :json_schema :schema])))
+          (check "koboldcpp :response_format strict"
+                 (true? (get-in kobold [:body :response_format :json_schema :strict])))))
 
       (section "Response translation")
       (let [resp {:body (json/generate-string
@@ -814,28 +695,27 @@
         (check "ollama response has choices"
                (= "hello back" (get-in result [:choices 0 :message :content]))))
       (let [resp {:body (json/generate-string
-                         {:results [{:text "kobold says hi"}]})}
+                         {:model "kobold"
+                          :choices [{:index 0
+                                     :message {:role "assistant" :content "kobold says hi"}
+                                     :finish_reason "stop"}]})}
             result (translate-response :koboldcpp resp)]
-        (check "koboldcpp response extracts text"
+        (check "koboldcpp response parses OpenAI-compat shape"
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
-      (check "grammar when supported"
-             (= :grammar (choose-strategy :llamacpp nil)))
-      (check "validate when not supported"
-             (= :validate (choose-strategy :ollama nil)))
-      (check "override to validate"
-             (= :validate (choose-strategy :llamacpp "validate")))
-      (check "override to grammar"
-             (= :grammar (choose-strategy :ollama "grammar")))
+      (check "default is grammar"
+             (= :grammar (choose-strategy nil)))
+      (check "\"grammar\" maps to :grammar"
+             (= :grammar (choose-strategy "grammar")))
+      (check "\"validate\" maps to :validate"
+             (= :validate (choose-strategy "validate")))
 
       (section "Model presets")
       (check "presets loaded" (pos? (count model-presets)))
       (check "llama3 preset exists" (contains? model-presets "llama3"))
       (check "llama3 preset has temperature"
              (= 0.6 (get-in model-presets ["llama3" :defaults :temperature])))
-      (check "llama3 preset has template"
-             (= :llama3 (get-in model-presets ["llama3" :template])))
       (let [req {:model "test" :messages [] :temperature 0.9}
             result (apply-model-preset req "llama3")]
         (check "preset applies defaults" (= 0.9 (get-in result [:top_p])))
@@ -846,8 +726,6 @@
       (let [req {:model "test"}
             result (apply-model-preset req "nonexistent")]
         (check "unknown family returns unchanged" (= req result)))
-      (check "preset template for llama3" (= :llama3 (get-preset-template "llama3")))
-      (check "preset template for unknown is nil" (nil? (get-preset-template "nonexistent")))
 
       (section "Smar fields extraction")
       (let [parsed {:smar_target "http://localhost:1234"
@@ -872,6 +750,26 @@
                     (not (contains? (:body result) :smar_backend))
                     (not (contains? (:body result) :smar_strategy))
                     (= "test" (:model (:body result))))))
+
+      (section "Input validation")
+      (check "extract-smar-fields accepts valid strategy \"grammar\""
+             (some? (extract-smar-fields {:smar_target "x" :smar_strategy "grammar"})))
+      (check "extract-smar-fields accepts valid strategy \"validate\""
+             (some? (extract-smar-fields {:smar_target "x" :smar_strategy "validate"})))
+      (check "valid-tools? rejects empty vector"
+             (false? (valid-tools? [])))
+      (check "valid-tools? accepts non-empty vector"
+             (true? (valid-tools? [{"name" "t" "parameters" {"type" "object"}}])))
+      (check "valid-strategy? rejects unknown"
+             (false? (valid-strategy? "llguidance")))
+      (check "valid-strategy? accepts nil (default)"
+             (true? (valid-strategy? nil)))
+      (check "valid-schema? rejects nil"
+             (false? (valid-schema? nil)))
+      (check "valid-schema? rejects non-map"
+             (false? (valid-schema? "json")))
+      (check "valid-schema? accepts map"
+             (true? (valid-schema? {:type "object"})))
 
       (section "CLI error formatting")
       (let [err-json (json/generate-string {:error {:message "test error"
