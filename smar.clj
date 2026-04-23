@@ -328,11 +328,10 @@
 ;; Structured output: strategy selection & retry
 ;; ---------------------------------------------------------------------------
 
-(defn choose-strategy [_backend-type strategy-override]
-  (cond
-    (= strategy-override "grammar")  :grammar
-    (= strategy-override "validate") :validate
-    :else                            :grammar))
+(defn choose-strategy [strategy-override]
+  (case strategy-override
+    "validate" :validate
+    :grammar))
 
 (defn forward-request [base-url translated]
   (let [url  (str base-url (:url translated))
@@ -459,7 +458,7 @@
         (let [backend-type  (resolve-backend-type target backend)
               openai-req    (-> (prepare-request body model-family)
                                 (update :messages inject-tools-prompt tools))
-              strat         (choose-strategy backend-type strategy)
+              strat         (choose-strategy strategy)
               constraint    (when (= strat :grammar) (tools->schema tools))
               validator     (fn [content] (validate-tool-call tools content))
               on-valid      (fn [_ validation]
@@ -473,7 +472,7 @@
         schema
         (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
-              strat        (choose-strategy backend-type strategy)
+              strat        (choose-strategy strategy)
               constraint   (when (= strat :grammar) schema)
               validator    (fn [content] (validate-response schema content))
               on-valid     (fn [openai-resp _] openai-resp)
@@ -688,10 +687,12 @@
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
 
       (section "Strategy selection")
-      (check "override to validate"
-             (= :validate (choose-strategy :llamacpp "validate")))
-      (check "override to grammar"
-             (= :grammar (choose-strategy :ollama "grammar")))
+      (check "default is grammar"
+             (= :grammar (choose-strategy nil)))
+      (check "\"grammar\" maps to :grammar"
+             (= :grammar (choose-strategy "grammar")))
+      (check "\"validate\" maps to :validate"
+             (= :validate (choose-strategy "validate")))
 
       (section "Model presets")
       (check "presets loaded" (pos? (count model-presets)))
