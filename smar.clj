@@ -511,6 +511,35 @@
                                       "You MUST respond with ONLY a JSON object: "
                                       "{\"name\": \"<tool_name>\", \"arguments\": {...}}")})))))))
 
+(defn complete-with-constraint
+  "Unified loop for schema-constrained and tool-constrained completions.
+   - `schema` is passed to translate-request (nil on the :validate path).
+   - `validator` is called on extracted content; it returns {:valid bool :errors ... :data? ...}.
+   - `on-valid` wraps a successful result (identity for schema, tool-call-response wrapper for tools)."
+  [base-url backend-type req schema validator on-valid max-retries]
+  (loop [attempt  0
+         messages (:messages req)]
+    (let [current-req (assoc req :messages messages)
+          translated  (translate-request backend-type current-req schema)
+          raw-resp    (forward-request base-url translated)
+          openai-resp (translate-response backend-type raw-resp)
+          raw-content (get-in openai-resp [:choices 0 :message :content] "")
+          content     (extract-json raw-content)
+          openai-resp (assoc-in openai-resp [:choices 0 :message :content] content)
+          validation  (validator content)]
+      (if (:valid validation)
+        (on-valid openai-resp validation)
+        (if (>= attempt max-retries)
+          (assoc openai-resp
+                 :smar_validation {:valid false :errors (:errors validation)})
+          (recur (inc attempt)
+                 (conj (vec messages)
+                       {:role "assistant" :content content}
+                       {:role "user"
+                        :content (str "Your previous response was invalid. "
+                                      "Errors: " (pr-str (:errors validation)) "\n"
+                                      "Please try again.")})))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Request handling
 ;; ---------------------------------------------------------------------------
@@ -601,31 +630,31 @@
         (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
 
         tools
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (-> (prepare-request body model-family)
-                               (update :messages inject-tools-prompt tools))
-              response     (backend-call
-                            #(complete-with-tool-validation target backend-type openai-req tools 3))]
+        (let [backend-type  (resolve-backend-type target backend)
+              openai-req    (-> (prepare-request body model-family)
+                                (update :messages inject-tools-prompt tools))
+              strat         (choose-strategy backend-type strategy)
+              constraint    (when (= strat :grammar) (tools->schema tools))
+              validator     (fn [content] (validate-tool-call tools content))
+              on-valid      (fn [_ validation]
+                              (tool-call-response (:model openai-req)
+                                                  (:tool-call validation)))
+              response      (backend-call
+                             #(complete-with-constraint target backend-type openai-req
+                                                        constraint validator on-valid 3))]
           (println (json/generate-string response)))
 
         schema
         (let [backend-type (resolve-backend-type target backend)
               openai-req   (prepare-request body model-family)
-              strat        (choose-strategy backend-type strategy)]
-          (cond
-            (= strat :grammar)
-            (let [translated (translate-request backend-type openai-req schema)
-                  raw-resp   (backend-call #(forward-request target translated))
-                  response   (translate-response backend-type raw-resp)
-                  content    (get-in response [:choices 0 :message :content] "")
-                  response   (assoc-in response [:choices 0 :message :content]
-                                       (extract-json content))]
-              (println (json/generate-string response)))
-
-            :else
-            (let [response (backend-call
-                            #(complete-with-validation target backend-type openai-req schema 3))]
-              (println (json/generate-string response)))))
+              strat        (choose-strategy backend-type strategy)
+              constraint   (when (= strat :grammar) schema)
+              validator    (fn [content] (validate-response schema content))
+              on-valid     (fn [openai-resp _] openai-resp)
+              response     (backend-call
+                            #(complete-with-constraint target backend-type openai-req
+                                                       constraint validator on-valid 3))]
+          (println (json/generate-string response)))
 
         :else
         (let [backend-type (resolve-backend-type target backend)
