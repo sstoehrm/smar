@@ -373,6 +373,15 @@
 ;; Request handling
 ;; ---------------------------------------------------------------------------
 
+(defn valid-strategy? [s]
+  (or (nil? s) (contains? #{"grammar" "validate"} s)))
+
+(defn valid-tools? [t]
+  (boolean (and (sequential? t) (seq t))))
+
+(defn valid-schema? [s]
+  (map? s))
+
 (defn extract-smar-fields [parsed-body]
   (let [target       (:smar_target parsed-body)
         schema       (:smar_schema parsed-body)
@@ -450,44 +459,52 @@
                       (cli-error 1 (str "Invalid JSON on stdin: " (.getMessage e)))))]
     (if-let [{:keys [target schema tools model-family backend strategy body]}
              (extract-smar-fields parsed)]
-      (cond
-        (and schema tools)
-        (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
+      (do
+        (when-not (valid-strategy? strategy)
+          (cli-error 1 (str "Invalid smar_strategy: " (pr-str strategy)
+                            ". Must be \"grammar\" or \"validate\".")))
+        (when (and tools (not (valid-tools? tools)))
+          (cli-error 1 "smar_tools must be a non-empty array"))
+        (when (and schema (not (valid-schema? schema)))
+          (cli-error 1 "smar_schema must be a JSON Schema object"))
+        (cond
+          (and schema tools)
+          (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
 
-        tools
-        (let [backend-type  (resolve-backend-type target backend)
-              openai-req    (-> (prepare-request body model-family)
-                                (update :messages inject-tools-prompt tools))
-              strat         (choose-strategy strategy)
-              constraint    (when (= strat :grammar) (tools->schema tools))
-              validator     (fn [content] (validate-tool-call tools content))
-              on-valid      (fn [_ validation]
-                              (tool-call-response (:model openai-req)
-                                                  (:tool-call validation)))
-              response      (backend-call
-                             #(complete-with-constraint target backend-type openai-req
-                                                        constraint validator on-valid 3))]
-          (println (json/generate-string response)))
+          tools
+          (let [backend-type  (resolve-backend-type target backend)
+                openai-req    (-> (prepare-request body model-family)
+                                  (update :messages inject-tools-prompt tools))
+                strat         (choose-strategy strategy)
+                constraint    (when (= strat :grammar) (tools->schema tools))
+                validator     (fn [content] (validate-tool-call tools content))
+                on-valid      (fn [_ validation]
+                                (tool-call-response (:model openai-req)
+                                                    (:tool-call validation)))
+                response      (backend-call
+                               #(complete-with-constraint target backend-type openai-req
+                                                          constraint validator on-valid 3))]
+            (println (json/generate-string response)))
 
-        schema
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (prepare-request body model-family)
-              strat        (choose-strategy strategy)
-              constraint   (when (= strat :grammar) schema)
-              validator    (fn [content] (validate-response schema content))
-              on-valid     (fn [openai-resp _] openai-resp)
-              response     (backend-call
-                            #(complete-with-constraint target backend-type openai-req
-                                                       constraint validator on-valid 3))]
-          (println (json/generate-string response)))
+          schema
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                strat        (choose-strategy strategy)
+                constraint   (when (= strat :grammar) schema)
+                validator    (fn [content] (validate-response schema content))
+                on-valid     (fn [openai-resp _] openai-resp)
+                response     (backend-call
+                              #(complete-with-constraint target backend-type openai-req
+                                                         constraint validator on-valid 3))]
+            (println (json/generate-string response)))
 
-        :else
-        (let [backend-type (resolve-backend-type target backend)
-              openai-req   (prepare-request body model-family)
-              translated   (translate-request backend-type openai-req nil)
-              raw-resp     (backend-call #(forward-request target translated))
-              response     (translate-response backend-type raw-resp)]
-          (println (json/generate-string response))))
+          :else
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                translated   (translate-request backend-type openai-req nil)
+                raw-resp     (backend-call #(forward-request target translated))
+                response     (translate-response backend-type raw-resp)]
+            (println (json/generate-string response)))))
       (cli-error 1 "Missing required field: smar_target"))))
 
 ;; ---------------------------------------------------------------------------
@@ -733,6 +750,26 @@
                     (not (contains? (:body result) :smar_backend))
                     (not (contains? (:body result) :smar_strategy))
                     (= "test" (:model (:body result))))))
+
+      (section "Input validation")
+      (check "extract-smar-fields accepts valid strategy \"grammar\""
+             (some? (extract-smar-fields {:smar_target "x" :smar_strategy "grammar"})))
+      (check "extract-smar-fields accepts valid strategy \"validate\""
+             (some? (extract-smar-fields {:smar_target "x" :smar_strategy "validate"})))
+      (check "valid-tools? rejects empty vector"
+             (false? (valid-tools? [])))
+      (check "valid-tools? accepts non-empty vector"
+             (true? (valid-tools? [{"name" "t" "parameters" {"type" "object"}}])))
+      (check "valid-strategy? rejects unknown"
+             (false? (valid-strategy? "llguidance")))
+      (check "valid-strategy? accepts nil (default)"
+             (true? (valid-strategy? nil)))
+      (check "valid-schema? rejects nil"
+             (false? (valid-schema? nil)))
+      (check "valid-schema? rejects non-map"
+             (false? (valid-schema? "json")))
+      (check "valid-schema? accepts map"
+             (true? (valid-schema? {:type "object"})))
 
       (section "CLI error formatting")
       (let [err-json (json/generate-string {:error {:message "test error"
