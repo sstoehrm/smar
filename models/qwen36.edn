@@ -1,0 +1,10 @@
+{:family      "qwen36"
+ :template    :chatml
+ :defaults    {:temperature      0.7
+               :top_p            0.8
+               :top_k            20
+               :min_p            0.0
+               :repeat_penalty   1.0
+               :presence_penalty 1.5
+               :max_tokens       4096}
+ :description "Alibaba Qwen 3.6 family (incl. 27B dense, 35B-A3B MoE). ChatML template; 262K native context, extensible to 1M via YaRN. presence_penalty 1.5 follows the vendor recommendation to curb repetition; tune within 0–2 if needed."}

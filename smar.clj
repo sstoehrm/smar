@@ -23,7 +23,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.4.0")
+(def smar-version "0.4.1")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -259,11 +259,13 @@
                   :messages (:messages req)
                   :stream   (get req :stream false)
                   :options  (cond-> {}
-                              (:temperature req)    (assoc :temperature (:temperature req))
-                              (:max_tokens req)     (assoc :num_predict (:max_tokens req))
-                              (:top_p req)          (assoc :top_p (:top_p req))
-                              (:top_k req)          (assoc :top_k (:top_k req))
-                              (:repeat_penalty req) (assoc :repeat_penalty (:repeat_penalty req)))}
+                              (:temperature req)      (assoc :temperature (:temperature req))
+                              (:max_tokens req)       (assoc :num_predict (:max_tokens req))
+                              (:top_p req)            (assoc :top_p (:top_p req))
+                              (:top_k req)            (assoc :top_k (:top_k req))
+                              (:min_p req)            (assoc :min_p (:min_p req))
+                              (:repeat_penalty req)   (assoc :repeat_penalty (:repeat_penalty req))
+                              (:presence_penalty req) (assoc :presence_penalty (:presence_penalty req)))}
            schema (assoc :format schema))})
 
 (defmethod translate-request :llamacpp [_ req schema]
