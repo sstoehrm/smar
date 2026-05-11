@@ -492,6 +492,16 @@
           (and schema tools)
           (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
 
+          grammar
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                translated   (-> (translate-request backend-type openai-req nil)
+                                 (assoc-in [:body :grammar]
+                                           (wrap-llguidance-grammar grammar)))
+                raw-resp     (backend-call #(forward-request target translated))
+                response     (translate-response backend-type raw-resp)]
+            (println (json/generate-string response)))
+
           tools
           (let [backend-type  (resolve-backend-type target backend)
                 openai-req    (-> (prepare-request body model-family)
