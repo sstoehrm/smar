@@ -433,7 +433,8 @@
                                         :models       models})))
       (cli-error 1 "Missing required field: smar_target"))))
 
-(def valid-backends #{:ollama :koboldcpp :llamacpp})
+(def valid-backends #{:ollama :koboldcpp :llamacpp :llguidance})
+(derive :llguidance :llamacpp)
 
 (defn resolve-backend-type [target smar-backend]
   (if smar-backend
@@ -441,7 +442,7 @@
       (if (valid-backends bt)
         bt
         (cli-error 1 (str "Unknown smar_backend: " smar-backend
-                          ". Must be one of: ollama, koboldcpp, llamacpp"))))
+                          ". Must be one of: ollama, koboldcpp, llamacpp, llguidance"))))
     (try (probe-backend target)
          (catch Exception e
            (cli-error 2 (str "Backend unreachable: " target
@@ -770,6 +771,10 @@
              (false? (valid-schema? "json")))
       (check "valid-schema? accepts map"
              (true? (valid-schema? {:type "object"})))
+      (check ":llguidance is in valid-backends"
+             (contains? valid-backends :llguidance))
+      (check ":llguidance derives from :llamacpp"
+             (isa? :llguidance :llamacpp))
 
       (section "CLI error formatting")
       (let [err-json (json/generate-string {:error {:message "test error"
