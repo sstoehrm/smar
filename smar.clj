@@ -23,7 +23,7 @@
 ;; Constants
 ;; ---------------------------------------------------------------------------
 
-(def smar-version "0.4.0")
+(def smar-version "0.5.0")
 
 ;; ---------------------------------------------------------------------------
 ;; Model presets
@@ -333,6 +333,12 @@
     "validate" :validate
     :grammar))
 
+(defn wrap-llguidance-grammar
+  "Prepend the llguidance dispatch prefix llama.cpp expects on the
+   `grammar` request field when built with -DLLAMA_LLGUIDANCE=ON."
+  [source]
+  (str "%llguidance {}\n" source))
+
 (defn forward-request [base-url translated]
   (let [url  (str base-url (:url translated))
         body (json/generate-string (:body translated))]
@@ -382,13 +388,17 @@
 (defn valid-schema? [s]
   (map? s))
 
+(defn valid-grammar? [g]
+  (and (string? g) (not (str/blank? g))))
+
 (defn extract-smar-fields [parsed-body]
   (let [target       (:smar_target parsed-body)
         schema       (:smar_schema parsed-body)
         tools        (:smar_tools parsed-body)
         model-family (:smar_model_family parsed-body)
         backend      (:smar_backend parsed-body)
-        strategy     (:smar_strategy parsed-body)]
+        strategy     (:smar_strategy parsed-body)
+        grammar      (:smar_grammar parsed-body)]
     (when target
       {:target       target
        :schema       schema
@@ -396,8 +406,10 @@
        :model-family model-family
        :backend      backend
        :strategy     strategy
+       :grammar      grammar
        :body         (dissoc parsed-body :smar_target :smar_schema :smar_tools
-                             :smar_model_family :smar_backend :smar_strategy)})))
+                             :smar_model_family :smar_backend :smar_strategy
+                             :smar_grammar)})))
 
 (defn inject-tools-prompt [messages tools]
   (let [system-msg {:role "system" :content (build-tools-system-prompt tools)}]
@@ -421,10 +433,13 @@
                     (catch Exception e
                       (cli-error 1 (str "Invalid JSON: " (.getMessage e)))))]
     (if-let [target (:smar_target parsed)]
-      (let [backend-type (try (probe-backend target)
-                              (catch Exception e
-                                (cli-error 2 (str "Backend unreachable: " target
-                                                  " — " (.getMessage e)))))
+      (let [requested    (:smar_backend parsed)
+            backend-type (if (= requested "llguidance")
+                           :llguidance
+                           (try (probe-backend target)
+                                (catch Exception e
+                                  (cli-error 2 (str "Backend unreachable: " target
+                                                    " — " (.getMessage e))))))
             models       (try (list-models-remote backend-type target)
                               (catch Exception _
                                 []))]
@@ -433,7 +448,8 @@
                                         :models       models})))
       (cli-error 1 "Missing required field: smar_target"))))
 
-(def valid-backends #{:ollama :koboldcpp :llamacpp})
+(def valid-backends #{:ollama :koboldcpp :llamacpp :llguidance})
+(derive :llguidance :llamacpp)
 
 (defn resolve-backend-type [target smar-backend]
   (if smar-backend
@@ -441,7 +457,7 @@
       (if (valid-backends bt)
         bt
         (cli-error 1 (str "Unknown smar_backend: " smar-backend
-                          ". Must be one of: ollama, koboldcpp, llamacpp"))))
+                          ". Must be one of: ollama, koboldcpp, llamacpp, llguidance"))))
     (try (probe-backend target)
          (catch Exception e
            (cli-error 2 (str "Backend unreachable: " target
@@ -457,7 +473,7 @@
         parsed (try (json/parse-string input true)
                     (catch Exception e
                       (cli-error 1 (str "Invalid JSON on stdin: " (.getMessage e)))))]
-    (if-let [{:keys [target schema tools model-family backend strategy body]}
+    (if-let [{:keys [target schema tools model-family backend strategy grammar body]}
              (extract-smar-fields parsed)]
       (do
         (when-not (valid-strategy? strategy)
@@ -467,9 +483,27 @@
           (cli-error 1 "smar_tools must be a non-empty array"))
         (when (and schema (not (valid-schema? schema)))
           (cli-error 1 "smar_schema must be a JSON Schema object"))
+        (when (and grammar (not (valid-grammar? grammar)))
+          (cli-error 1 "smar_grammar must be a non-empty string"))
+        (when (and grammar schema)
+          (cli-error 1 "smar_grammar and smar_schema are mutually exclusive"))
+        (when (and grammar tools)
+          (cli-error 1 "smar_grammar and smar_tools are mutually exclusive"))
+        (when (and grammar (not= backend "llguidance"))
+          (cli-error 1 "smar_grammar requires smar_backend: \"llguidance\""))
         (cond
           (and schema tools)
           (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
+
+          grammar
+          (let [backend-type (resolve-backend-type target backend)
+                openai-req   (prepare-request body model-family)
+                translated   (-> (translate-request backend-type openai-req nil)
+                                 (assoc-in [:body :grammar]
+                                           (wrap-llguidance-grammar grammar)))
+                raw-resp     (backend-call #(forward-request target translated))
+                response     (translate-response backend-type raw-resp)]
+            (println (json/generate-string response)))
 
           tools
           (let [backend-type  (resolve-backend-type target backend)
@@ -666,7 +700,11 @@
           (check "llamacpp url" (= "/v1/chat/completions" (:url llama)))
           (check "llamacpp passes body through" (= req (:body llama)))
           (check "llamacpp has no :response_format when schema is nil"
-                 (nil? (get-in llama [:body :response_format])))))
+                 (nil? (get-in llama [:body :response_format]))))
+        (let [llamacpp-out   (translate-request :llamacpp   req nil)
+              llguidance-out (translate-request :llguidance req nil)]
+          (check ":llguidance translate-request inherits from :llamacpp (no schema)"
+                 (= llamacpp-out llguidance-out))))
 
       (section "Request translation (with schema)")
       (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]}
@@ -685,7 +723,11 @@
           (check "koboldcpp :response_format schema"
                  (= schema (get-in kobold [:body :response_format :json_schema :schema])))
           (check "koboldcpp :response_format strict"
-                 (true? (get-in kobold [:body :response_format :json_schema :strict])))))
+                 (true? (get-in kobold [:body :response_format :json_schema :strict]))))
+        (let [llamacpp-out   (translate-request :llamacpp   req schema)
+              llguidance-out (translate-request :llguidance req schema)]
+          (check ":llguidance translate-request inherits from :llamacpp (with schema)"
+                 (= llamacpp-out llguidance-out))))
 
       (section "Response translation")
       (let [resp {:body (json/generate-string
@@ -702,6 +744,14 @@
             result (translate-response :koboldcpp resp)]
         (check "koboldcpp response parses OpenAI-compat shape"
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
+
+      (section "llguidance grammar wrapping")
+      (check "wraps with %llguidance prefix and newline"
+             (= "%llguidance {}\nstart: \"X\""
+                (wrap-llguidance-grammar "start: \"X\"")))
+      (check "preserves multi-line grammar source"
+             (= "%llguidance {}\nstart: A\nA: \"a\""
+                (wrap-llguidance-grammar "start: A\nA: \"a\"")))
 
       (section "Strategy selection")
       (check "default is grammar"
@@ -734,6 +784,7 @@
                     :smar_model_family "llama3"
                     :smar_backend "ollama"
                     :smar_strategy "grammar"
+                    :smar_grammar "start: \"X\""
                     :model "test" :messages []}
             result (extract-smar-fields parsed)]
         (check "extracts target" (= "http://localhost:1234" (:target result)))
@@ -749,7 +800,10 @@
                     (not (contains? (:body result) :smar_model_family))
                     (not (contains? (:body result) :smar_backend))
                     (not (contains? (:body result) :smar_strategy))
-                    (= "test" (:model (:body result))))))
+                    (= "test" (:model (:body result)))))
+        (check "extracts grammar" (= "start: \"X\"" (:grammar result)))
+        (check "strips smar_grammar from body"
+               (not (contains? (:body result) :smar_grammar))))
 
       (section "Input validation")
       (check "extract-smar-fields accepts valid strategy \"grammar\""
@@ -770,6 +824,20 @@
              (false? (valid-schema? "json")))
       (check "valid-schema? accepts map"
              (true? (valid-schema? {:type "object"})))
+      (check ":llguidance is in valid-backends"
+             (contains? valid-backends :llguidance))
+      (check ":llguidance derives from :llamacpp"
+             (isa? :llguidance :llamacpp))
+      (check "valid-grammar? rejects nil"
+             (false? (valid-grammar? nil)))
+      (check "valid-grammar? rejects empty string"
+             (false? (valid-grammar? "")))
+      (check "valid-grammar? rejects blank string"
+             (false? (valid-grammar? "   ")))
+      (check "valid-grammar? rejects non-string"
+             (false? (valid-grammar? 42)))
+      (check "valid-grammar? accepts non-empty string"
+             (true? (valid-grammar? "start: \"X\"")))
 
       (section "CLI error formatting")
       (let [err-json (json/generate-string {:error {:message "test error"

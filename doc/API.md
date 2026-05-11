@@ -99,8 +99,9 @@ echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"rol
 | `smar_model_family` | string | no | Model family preset (e.g. `llama3`, `mistral`, `qwen3`) |
 | `smar_schema` | object | no | JSON Schema for structured output enforcement |
 | `smar_tools` | array | no | Tool definitions for tool call enforcement |
-| `smar_backend` | string | no | Skip backend probe. One of: `ollama`, `koboldcpp`, `llamacpp` |
+| `smar_backend` | string | no | Skip backend probe. One of: `ollama`, `koboldcpp`, `llamacpp`, `llguidance`. `"llguidance"` is a llama.cpp build with `-DLLAMA_LLGUIDANCE=ON`; it can only be selected explicitly (no auto-detection). |
 | `smar_strategy` | string | no | Override structured output strategy: `grammar` or `validate` |
+| `smar_grammar` | string | no | Lark or regular-expression source enforced as a decode-time constraint by [llguidance](https://github.com/guidance-ai/llguidance). Requires `smar_backend: "llguidance"`. smar wraps the value with the `%llguidance {}` prefix llama.cpp expects when built with `-DLLAMA_LLGUIDANCE=ON`. Mutually exclusive with `smar_schema` and `smar_tools`. No retries — the constraint is enforced at sample time. |
 | `model` | string | yes | Model name as reported by the backend |
 | `messages` | array | yes | Array of `{role, content}` message objects |
 | `temperature` | number | no | Sampling temperature |
@@ -109,7 +110,7 @@ echo '{"smar_target":"http://localhost:11434","model":"llama3","messages":[{"rol
 | `repeat_penalty` | number | no | Repetition penalty |
 | `max_tokens` | integer | no | Max tokens to generate |
 
-`smar_schema` and `smar_tools` are mutually exclusive. If both are present, smar exits with an error.
+`smar_schema`, `smar_tools`, and `smar_grammar` are mutually exclusive. If more than one is present, smar exits with an error.
 
 All `smar_*` fields are stripped from the body before forwarding to the backend.
 
