@@ -679,7 +679,11 @@
           (check "llamacpp url" (= "/v1/chat/completions" (:url llama)))
           (check "llamacpp passes body through" (= req (:body llama)))
           (check "llamacpp has no :response_format when schema is nil"
-                 (nil? (get-in llama [:body :response_format])))))
+                 (nil? (get-in llama [:body :response_format]))))
+        (let [llamacpp-out   (translate-request :llamacpp   req nil)
+              llguidance-out (translate-request :llguidance req nil)]
+          (check ":llguidance translate-request inherits from :llamacpp (no schema)"
+                 (= llamacpp-out llguidance-out))))
 
       (section "Request translation (with schema)")
       (let [req    {:model "llama3" :messages [{:role "user" :content "hi"}]}
@@ -698,7 +702,11 @@
           (check "koboldcpp :response_format schema"
                  (= schema (get-in kobold [:body :response_format :json_schema :schema])))
           (check "koboldcpp :response_format strict"
-                 (true? (get-in kobold [:body :response_format :json_schema :strict])))))
+                 (true? (get-in kobold [:body :response_format :json_schema :strict]))))
+        (let [llamacpp-out   (translate-request :llamacpp   req schema)
+              llguidance-out (translate-request :llguidance req schema)]
+          (check ":llguidance translate-request inherits from :llamacpp (with schema)"
+                 (= llamacpp-out llguidance-out))))
 
       (section "Response translation")
       (let [resp {:body (json/generate-string
