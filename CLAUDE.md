@@ -49,8 +49,9 @@ Mode determined by which `smar_*` fields are present:
 - `smar_schema` -> structured JSON output (GBNF or validate+retry)
 - `smar_tools` -> enforce valid tool call response (validate+retry)
 - `smar_model_family` -> apply preset defaults (temperature, top_p, top_k, repeat_penalty, template)
-- `smar_backend` -> skip backend probe, use given type (`ollama`, `koboldcpp`, `llamacpp`)
+- `smar_backend` -> skip backend probe, use given type (`ollama`, `koboldcpp`, `llamacpp`, `llguidance`)
 - `smar_strategy` -> override structured output strategy (`grammar` or `validate`)
+- `smar_grammar` -> Lark/regex constraint via llguidance (requires `smar_backend: "llguidance"`)
 - Both `smar_schema` + `smar_tools` -> error (mutually exclusive)
 
 ### Error handling
@@ -71,6 +72,11 @@ Each file: `{:family "name" :defaults {:temperature ...} :description "..."}`.
 ## Backend detection
 
 Auto-detects by probing: `/api/tags` -> ollama, `/api/v1/model` -> koboldcpp, else -> llamacpp.
+`:llguidance` cannot be auto-detected (no fingerprint on `/props`); clients
+must opt in explicitly via `smar_backend: "llguidance"`. The backend
+derives from `:llamacpp` and inherits all behaviours except that
+`smar_grammar` is wrapped with the `%llguidance {}` prefix and sent on the
+`grammar` field of `/v1/chat/completions`.
 Translation via multimethods: `translate-request` (takes schema as a 3rd arg),
 `translate-response`, `list-models-remote`. koboldcpp uses the OpenAI-compat
 endpoint (`/v1/chat/completions`), so no client-side chat-template application
