@@ -433,10 +433,13 @@
                     (catch Exception e
                       (cli-error 1 (str "Invalid JSON: " (.getMessage e)))))]
     (if-let [target (:smar_target parsed)]
-      (let [backend-type (try (probe-backend target)
-                              (catch Exception e
-                                (cli-error 2 (str "Backend unreachable: " target
-                                                  " — " (.getMessage e)))))
+      (let [requested    (:smar_backend parsed)
+            backend-type (if (= requested "llguidance")
+                           :llguidance
+                           (try (probe-backend target)
+                                (catch Exception e
+                                  (cli-error 2 (str "Backend unreachable: " target
+                                                    " — " (.getMessage e))))))
             models       (try (list-models-remote backend-type target)
                               (catch Exception _
                                 []))]
