@@ -382,6 +382,9 @@
 (defn valid-schema? [s]
   (map? s))
 
+(defn valid-grammar? [g]
+  (and (string? g) (not (str/blank? g))))
+
 (defn extract-smar-fields [parsed-body]
   (let [target       (:smar_target parsed-body)
         schema       (:smar_schema parsed-body)
@@ -775,6 +778,16 @@
              (contains? valid-backends :llguidance))
       (check ":llguidance derives from :llamacpp"
              (isa? :llguidance :llamacpp))
+      (check "valid-grammar? rejects nil"
+             (false? (valid-grammar? nil)))
+      (check "valid-grammar? rejects empty string"
+             (false? (valid-grammar? "")))
+      (check "valid-grammar? rejects blank string"
+             (false? (valid-grammar? "   ")))
+      (check "valid-grammar? rejects non-string"
+             (false? (valid-grammar? 42)))
+      (check "valid-grammar? accepts non-empty string"
+             (true? (valid-grammar? "start: \"X\"")))
 
       (section "CLI error formatting")
       (let [err-json (json/generate-string {:error {:message "test error"
