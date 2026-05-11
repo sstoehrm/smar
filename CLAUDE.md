@@ -77,6 +77,7 @@ must opt in explicitly via `smar_backend: "llguidance"`. The backend
 derives from `:llamacpp` and inherits all behaviours except that
 `smar_grammar` is wrapped with the `%llguidance {}` prefix and sent on the
 `grammar` field of `/v1/chat/completions`.
+
 Translation via multimethods: `translate-request` (takes schema as a 3rd arg),
 `translate-response`, `list-models-remote`. koboldcpp uses the OpenAI-compat
 endpoint (`/v1/chat/completions`), so no client-side chat-template application
