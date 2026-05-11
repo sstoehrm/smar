@@ -470,7 +470,7 @@
         parsed (try (json/parse-string input true)
                     (catch Exception e
                       (cli-error 1 (str "Invalid JSON on stdin: " (.getMessage e)))))]
-    (if-let [{:keys [target schema tools model-family backend strategy body]}
+    (if-let [{:keys [target schema tools model-family backend strategy grammar body]}
              (extract-smar-fields parsed)]
       (do
         (when-not (valid-strategy? strategy)
@@ -480,6 +480,14 @@
           (cli-error 1 "smar_tools must be a non-empty array"))
         (when (and schema (not (valid-schema? schema)))
           (cli-error 1 "smar_schema must be a JSON Schema object"))
+        (when (and grammar (not (valid-grammar? grammar)))
+          (cli-error 1 "smar_grammar must be a non-empty string"))
+        (when (and grammar schema)
+          (cli-error 1 "smar_grammar and smar_schema are mutually exclusive"))
+        (when (and grammar tools)
+          (cli-error 1 "smar_grammar and smar_tools are mutually exclusive"))
+        (when (and grammar (not= backend "llguidance"))
+          (cli-error 1 "smar_grammar requires smar_backend: \"llguidance\""))
         (cond
           (and schema tools)
           (cli-error 1 "smar_schema and smar_tools are mutually exclusive")
