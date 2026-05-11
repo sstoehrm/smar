@@ -391,7 +391,8 @@
         tools        (:smar_tools parsed-body)
         model-family (:smar_model_family parsed-body)
         backend      (:smar_backend parsed-body)
-        strategy     (:smar_strategy parsed-body)]
+        strategy     (:smar_strategy parsed-body)
+        grammar      (:smar_grammar parsed-body)]
     (when target
       {:target       target
        :schema       schema
@@ -399,8 +400,10 @@
        :model-family model-family
        :backend      backend
        :strategy     strategy
+       :grammar      grammar
        :body         (dissoc parsed-body :smar_target :smar_schema :smar_tools
-                             :smar_model_family :smar_backend :smar_strategy)})))
+                             :smar_model_family :smar_backend :smar_strategy
+                             :smar_grammar)})))
 
 (defn inject-tools-prompt [messages tools]
   (let [system-msg {:role "system" :content (build-tools-system-prompt tools)}]
@@ -738,6 +741,7 @@
                     :smar_model_family "llama3"
                     :smar_backend "ollama"
                     :smar_strategy "grammar"
+                    :smar_grammar "start: \"X\""
                     :model "test" :messages []}
             result (extract-smar-fields parsed)]
         (check "extracts target" (= "http://localhost:1234" (:target result)))
@@ -753,7 +757,10 @@
                     (not (contains? (:body result) :smar_model_family))
                     (not (contains? (:body result) :smar_backend))
                     (not (contains? (:body result) :smar_strategy))
-                    (= "test" (:model (:body result))))))
+                    (= "test" (:model (:body result)))))
+        (check "extracts grammar" (= "start: \"X\"" (:grammar result)))
+        (check "strips smar_grammar from body"
+               (not (contains? (:body result) :smar_grammar))))
 
       (section "Input validation")
       (check "extract-smar-fields accepts valid strategy \"grammar\""
