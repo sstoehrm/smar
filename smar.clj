@@ -333,6 +333,12 @@
     "validate" :validate
     :grammar))
 
+(defn wrap-llguidance-grammar
+  "Prepend the llguidance dispatch prefix llama.cpp expects on the
+   `grammar` request field when built with -DLLAMA_LLGUIDANCE=ON."
+  [source]
+  (str "%llguidance {}\n" source))
+
 (defn forward-request [base-url translated]
   (let [url  (str base-url (:url translated))
         body (json/generate-string (:body translated))]
@@ -709,6 +715,14 @@
             result (translate-response :koboldcpp resp)]
         (check "koboldcpp response parses OpenAI-compat shape"
                (= "kobold says hi" (get-in result [:choices 0 :message :content]))))
+
+      (section "llguidance grammar wrapping")
+      (check "wraps with %llguidance prefix and newline"
+             (= "%llguidance {}\nstart: \"X\""
+                (wrap-llguidance-grammar "start: \"X\"")))
+      (check "preserves multi-line grammar source"
+             (= "%llguidance {}\nstart: A\nA: \"a\""
+                (wrap-llguidance-grammar "start: A\nA: \"a\"")))
 
       (section "Strategy selection")
       (check "default is grammar"
